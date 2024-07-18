@@ -2,7 +2,6 @@ use arrow::record_batch::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::BaselineMetrics;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::Result;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -27,7 +26,7 @@ impl ScanWithIndexStream {
             baseline_metrics,
         }
     }
-    fn stream_scan(&mut self, batch: RecordBatch) -> Option<RecordBatch> {
+    async fn stream_scan(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
         unimplemented!()
     }
 }
@@ -39,14 +38,10 @@ impl Stream for ScanWithIndexStream {
         let poll = match &mut self.input {
             // input has been cleared
             None => Poll::Ready(None),
-            Some(input) => {
-                let poll = input.poll_next_unpin(cx);
-
-                poll.map(|item| match item {
-                    Some(Ok(batch)) => Ok(self.stream_scan(batch)).transpose(),
-                    other => other,
-                })
-            }
+            Some(input) => match input.poll_next_unpin(cx) {
+                Poll::Ready(record) => Poll::Ready(record),
+                Poll::Pending => Poll::Pending,
+            },
         };
         self.baseline_metrics.record_poll(poll)
     }
