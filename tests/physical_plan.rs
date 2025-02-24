@@ -3,7 +3,6 @@ use datafusion::common::DataFusionError;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlanBuilder;
-use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::ExecutionPlan;

@@ -1,8 +1,8 @@
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::BaselineMetrics;
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion_common::Result;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 #[async_trait]
-pub trait MapIndexWithRecord {
+pub trait MapIndexWithRecord: Send + Sync {
     async fn map_index_with_record(&mut self, index_batch: RecordBatch) -> Result<RecordBatch>;
 }
 
@@ -28,9 +28,11 @@ pub struct ScanWithIndexStream {
 impl ScanWithIndexStream {
     pub fn new(
         input: SendableRecordBatchStream,
-        baseline_metrics: BaselineMetrics,
+        partition: usize,
         mapper: Box<dyn MapIndexWithRecord>,
     ) -> Self {
+        let metriccs = ExecutionPlanMetricsSet::new();
+        let baseline_metrics = BaselineMetrics::new(&metriccs, partition);
         let schema = input.schema();
         Self {
             input: Some(input),
@@ -68,13 +70,18 @@ impl Stream for ScanWithIndexStream {
     }
 }
 
+impl RecordBatchStream for ScanWithIndexStream {
+    fn schema(&self) -> SchemaRef {
+        self.data_schema.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{Array, UInt8Array, UInt8Builder};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::memory::MemoryStream;
-    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -147,12 +154,9 @@ mod tests {
     async fn single_index() {
         let stream = Box::pin(create_index_memory_stream(vec![1, 2]).unwrap());
 
-        let execution_plan_metrics = ExecutionPlanMetricsSet::new();
-        let metrics = BaselineMetrics::new(&execution_plan_metrics, 0);
-
         let mut mapper = ScanWithIndexStream::new(
             stream,
-            metrics,
+            0,
             Box::new(Mapper::new_and_init(HashMap::from([(1, 42), (2, 43)]))),
         );
 
