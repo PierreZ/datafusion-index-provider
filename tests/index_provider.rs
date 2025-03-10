@@ -1,4 +1,4 @@
-use crate::common::{get_user, scan_age_index, User};
+use crate::common::{get_users, scan_age_index, User};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -22,22 +22,56 @@ use std::collections::Bound::Included;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
+use std::ops::Bound::Excluded;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
 mod common;
 
+// Mapping between id and age from populated users:
+// id: 1 -> age: 15
+// id: 2 -> age: 20
+// id: 3 -> age: 50
+
 #[tokio::test]
-async fn physical_plan() {
+async fn physical_plan_no_result() {
     let custom_db = Arc::new(CustomDataSource::default());
 
     search_accounts(custom_db.clone(), Some(col("age").eq(lit(999))), vec![])
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn physical_plan_eq_15() {
+    let custom_db = Arc::new(CustomDataSource::default());
+
     search_accounts(custom_db.clone(), Some(col("age").eq(lit(15))), vec![1])
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn physical_plan_greater_than_15() {
+    let custom_db = Arc::new(CustomDataSource::default());
+
+    search_accounts(custom_db.clone(), Some(col("age").gt(lit(15))), vec![2, 3])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn physical_plan_greater_eq_than_15() {
+    let custom_db = Arc::new(CustomDataSource::default());
+
+    search_accounts(
+        custom_db.clone(),
+        Some(col("age").gt_eq(lit(15))),
+        vec![1, 2, 3],
+    )
+    .await
+    .unwrap();
 }
 
 async fn search_accounts(
@@ -59,9 +93,6 @@ async fn search_accounts(
         dataframe = dataframe.filter(f)?;
     }
 
-    let physical_plan = dataframe.clone().create_physical_plan().await?;
-    dbg!(physical_plan);
-
     timeout(Duration::from_secs(10), async move {
         let result = dataframe.collect().await.unwrap();
         let record_batch = result.first().unwrap();
@@ -75,7 +106,11 @@ async fn search_accounts(
             .flatten()
             .collect();
 
-        assert_eq!(expected_ids, ids);
+        assert_eq!(
+            expected_ids, ids,
+            "received ids: {:?}, was expecting {:?}",
+            ids, expected_ids
+        );
 
         dbg!(record_batch.columns());
     })
@@ -147,7 +182,16 @@ impl TableProvider for CustomDataSource {
 
 impl IndexProvider for CustomDataSource {
     fn get_indexes(&self) -> HashMap<String, Vec<Operator>> {
-        HashMap::from([("age".to_string(), vec![Operator::Eq])])
+        HashMap::from([(
+            "age".to_string(),
+            vec![
+                Operator::Eq,
+                Operator::Gt,
+                Operator::GtEq,
+                Operator::Lt,
+                Operator::LtEq,
+            ],
+        )])
     }
 }
 
@@ -225,38 +269,67 @@ impl ExecutionPlan for RecordExec {
         if self.filters.is_empty() {
             return Ok(self);
         }
+        let indexes = self.index_provider.get_indexes();
 
-        let filter = self.filters.first().unwrap();
+        match self.filters.first() {
+            None => return Ok(self),
+            Some(filter) => {
+                match dbg!(filter) {
+                    Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                        match (left.as_ref(), op, right.as_ref()) {
+                            // Eq
+                            (Expr::Column(col_name), Operator::Eq, Expr::Literal(scalar_value))
+                            | (Expr::Literal(scalar_value), Operator::Eq, Expr::Column(col_name)) => {
+                                if let ScalarValue::UInt64(Some(v)) = scalar_value {
+                                    let range = (Included(v.to_owned()), Included(v.to_owned()));
+                                    let scan_index = scan_age_index(range);
 
-        if let Expr::BinaryExpr(BinaryExpr { left, right, op }) = filter {
-            if let (Expr::Column(col_name), Expr::Literal(scalar_value)) = (&**left, &**right) {
-                if op == &Operator::Eq {
-                    // Check if the column has an index
-                    let indexes = self.index_provider.get_indexes();
-                    if let Some(ops) = indexes.get(col_name.name()) {
-                        if ops.contains(&Operator::Eq) {
-                            dbg!(col_name.name(), scalar_value, op);
-
-                            // TODO: how to dynamically get schema?
-                            if let ScalarValue::UInt64(Some(v)) = scalar_value {
-                                let range = (Included(v.to_owned()), Included(v.to_owned()));
-                                let scan_index = scan_age_index(range);
-
-                                return Ok(Arc::new(MapRecordExec {
-                                    input: scan_index,
-                                    schema: User::get_schema(),
-                                    cache: RecordExec::compute_properties(User::get_schema()),
-                                }));
+                                    Ok(Arc::new(MapRecordExec {
+                                        input: scan_index,
+                                        schema: User::get_schema(),
+                                        cache: RecordExec::compute_properties(User::get_schema()),
+                                    }))
+                                } else {
+                                    unimplemented!()
+                                }
                             }
+                            // Gt and GtEq
+                            (Expr::Column(col_name), Operator::Gt, Expr::Literal(scalar_value))
+                            | (Expr::Literal(scalar_value), Operator::Gt, Expr::Column(col_name))
+                            | (
+                                Expr::Column(col_name),
+                                Operator::GtEq,
+                                Expr::Literal(scalar_value),
+                            )
+                            | (
+                                Expr::Literal(scalar_value),
+                                Operator::GtEq,
+                                Expr::Column(col_name),
+                            ) => {
+                                if let ScalarValue::UInt64(Some(v)) = scalar_value {
+                                    let range = if op.eq(&Operator::Gt) {
+                                        (Excluded(v.to_owned()), Excluded(u64::MAX))
+                                    } else {
+                                        (Included(v.to_owned()), Included(u64::MAX))
+                                    };
+                                    let scan_index = scan_age_index(range);
 
-                            unimplemented!()
+                                    Ok(Arc::new(MapRecordExec {
+                                        input: scan_index,
+                                        schema: User::get_schema(),
+                                        cache: RecordExec::compute_properties(User::get_schema()),
+                                    }))
+                                } else {
+                                    unimplemented!()
+                                }
+                            }
+                            _ => unimplemented!(),
                         }
                     }
+                    _ => unimplemented!(),
                 }
             }
         }
-
-        unimplemented!()
     }
 
     fn execute(
@@ -347,11 +420,6 @@ impl MapIndexWithRecord for Mapper {
         let index_entry = column.as_any().downcast_ref::<UInt64Array>().unwrap();
         let index_entry: Vec<u64> = index_entry.iter().flatten().collect();
 
-        dbg!(&index_entry);
-
-        match index_entry.first() {
-            None => Ok(RecordBatch::new_empty(User::get_schema())),
-            Some(id) => Ok(get_user(*id).unwrap()),
-        }
+        Ok(get_users(&index_entry).unwrap())
     }
 }

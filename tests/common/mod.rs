@@ -63,7 +63,7 @@ impl CustomDataSourceInner {
         self.add_user(User {
             id: 2,
             amount: 100,
-            age: 2,
+            age: 20,
         });
         self.add_user(User {
             id: 3,
@@ -96,6 +96,38 @@ pub fn get_user(id: u64) -> Option<RecordBatch> {
     } else {
         None
     }
+}
+
+pub fn get_users(ids: &[u64]) -> Result<RecordBatch, String> {
+    let mut local_ids = Vec::with_capacity(ids.len());
+    let mut amounts = Vec::with_capacity(ids.len());
+    let mut ages = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        let maybe = CELL
+            .get_or_init(CustomDataSourceInner::default)
+            .users
+            .get(&id)
+            .cloned();
+
+        if let Some(user) = maybe {
+            local_ids.push(user.id);
+            amounts.push(user.amount);
+            ages.push(user.age);
+        } else {
+            return Err(format!("id {} not found", id));
+        }
+    }
+    let schema = User::get_schema();
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(local_ids)),
+            Arc::new(UInt64Array::from(amounts)),
+            Arc::new(UInt64Array::from(ages)),
+        ],
+    )
+    .unwrap())
 }
 
 pub fn scan_age_index(range: (Bound<u64>, Bound<u64>)) -> Arc<dyn ExecutionPlan> {
