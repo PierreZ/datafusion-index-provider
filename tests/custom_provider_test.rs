@@ -158,7 +158,7 @@ impl AgeIndex {
                 .copied()
                 .collect(),
             Operator::Eq => self.index.get(&value).map_or(vec![], |rows| rows.clone()),
-            _ => vec![], // Unsupported operators return empty vec
+            _ => unimplemented!(),
         }
     }
 }
@@ -237,6 +237,7 @@ impl TableProvider for EmployeeTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        log::debug!("Checking filters: {:?}", &filters);
         // Look for age-related filters
         let mut filtered_indices = None;
 
@@ -252,6 +253,8 @@ impl TableProvider for EmployeeTableProvider {
                 }
             }
         }
+
+        log::debug!("Filtered indices: {:?}", &filtered_indices);
 
         // Create the index lookup execution plan
         let index_schema = Arc::new(Schema::new(vec![Field::new(
@@ -278,6 +281,7 @@ impl TableProvider for EmployeeTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
+        log::debug!("Checking filters: {:?}", filters);
         let mut pushdown = Vec::with_capacity(filters.len());
         for filter in filters {
             if let Expr::BinaryExpr(expr) = *filter {
@@ -426,11 +430,7 @@ impl ExecutionPlan for IndexJoinExec {
 }
 
 fn apply_row_filter(batch: &RecordBatch, row_ids: &[usize]) -> Result<RecordBatch> {
-    log::debug!(
-        "Applying row filter to batch: {:?}. Row ids: {:?}",
-        batch,
-        row_ids
-    );
+    log::debug!("Row ids: {:?}", row_ids);
     let new_columns: Result<Vec<Arc<dyn Array>>> = batch
         .columns()
         .iter()
@@ -443,13 +443,11 @@ fn apply_row_filter(batch: &RecordBatch, row_ids: &[usize]) -> Result<RecordBatc
         })
         .collect();
 
-    log::debug!("Applying row filter to batch: {:?}", &new_columns);
-
     Ok(RecordBatch::try_new(batch.schema(), new_columns?)?)
 }
 
-#[tokio::test]
-async fn test_employee_table_provider() {
+/// Helper function to setup test environment
+async fn setup_test_env() -> SessionContext {
     let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
         .is_test(true)
@@ -462,13 +460,23 @@ async fn test_employee_table_provider() {
     let provider = EmployeeTableProvider::new();
     ctx.register_table("employees", Arc::new(provider)).unwrap();
 
-    // Test 1: Simple SELECT
+    ctx
+}
+
+#[tokio::test]
+async fn test_employee_table_basic_select() {
+    let ctx = setup_test_env().await;
+
     let df = ctx.sql("SELECT * FROM employees").await.unwrap();
     let results = df.collect().await.unwrap();
     assert_eq!(results[0].num_rows(), 5);
     assert_eq!(results[0].num_columns(), 4);
+}
 
-    // Test 2: Filter by age using index (less than)
+#[tokio::test]
+async fn test_employee_table_filter_age_less_than() {
+    let ctx = setup_test_env().await;
+
     let df = ctx
         .sql("SELECT name, age FROM employees WHERE age < 30")
         .await
@@ -481,8 +489,12 @@ async fn test_employee_table_provider() {
         .unwrap();
     assert!(names.iter().any(|n| n == Some("Alice"))); // Alice is 25
     assert!(names.iter().any(|n| n == Some("David"))); // David is 28
+}
 
-    // Test 3: Filter by age using index (greater than or equal)
+#[tokio::test]
+async fn test_employee_table_filter_age_greater_equal() {
+    let ctx = setup_test_env().await;
+
     let df = ctx
         .sql("SELECT name, age FROM employees WHERE age >= 30")
         .await
@@ -496,8 +508,12 @@ async fn test_employee_table_provider() {
     assert!(names.iter().any(|n| n == Some("Bob"))); // Bob is 30
     assert!(names.iter().any(|n| n == Some("Charlie"))); // Charlie is 35
     assert!(names.iter().any(|n| n == Some("Eve"))); // Eve is 32
+}
 
-    // Test 4: Exact age match using index
+#[tokio::test]
+async fn test_employee_table_filter_age_exact() {
+    let ctx = setup_test_env().await;
+
     let df = ctx
         .sql("SELECT name, age FROM employees WHERE age = 35")
         .await
@@ -510,4 +526,24 @@ async fn test_employee_table_provider() {
         .unwrap();
     assert!(names.iter().any(|n| n == Some("Charlie"))); // Only Charlie is 35
     assert_eq!(names.len() as usize, 1);
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_age_between() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age BETWEEN 25 AND 30")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    let names = results[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(names.iter().any(|n| n == Some("Alice"))); // Alice is 25
+    assert!(names.iter().any(|n| n == Some("David"))); // David is 28
+    assert!(names.iter().any(|n| n == Some("Bob"))); // Bob is 30
+    assert_eq!(names.len() as usize, 3);
 }
