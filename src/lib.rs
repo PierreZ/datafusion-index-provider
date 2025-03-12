@@ -5,11 +5,14 @@ use datafusion::datasource::TableProvider;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::Expr;
 use datafusion_common::Result;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// Represents information about an indexed column
@@ -34,6 +37,18 @@ pub trait IndexProvider: TableProvider {
             .map(|idx| idx.supported_operators.contains(op))
             .unwrap_or(false)
     }
+
+    /// Creates an IndexLookupExec for the given filter expression
+    /// Returns None if the filter cannot use an index
+    fn create_index_lookup(&self, expr: &Expr) -> Result<Option<Arc<dyn ExecutionPlan>>>;
+
+    /// Creates an execution plan that combines multiple index lookups
+    /// Default implementation uses HashJoinExec when multiple indexes are used
+    fn create_index_join(
+        &self,
+        lookups: Vec<Arc<dyn ExecutionPlan>>,
+        projection: Option<&Vec<usize>>,
+    ) -> Result<Arc<dyn ExecutionPlan>>;
 }
 
 #[async_trait]
