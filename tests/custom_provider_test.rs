@@ -17,7 +17,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_index_provider::*;
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -171,6 +171,27 @@ pub struct EmployeeTableProvider {
     age_index: AgeIndex,
 }
 
+#[async_trait]
+impl IndexProvider for EmployeeTableProvider {
+    fn get_indexed_columns(&self) -> HashMap<String, IndexedColumn> {
+        let mut map = HashMap::new();
+        map.insert(
+            "age".to_string(),
+            IndexedColumn {
+                name: "age".to_string(),
+                supported_operators: vec![
+                    Operator::Eq,
+                    Operator::Gt,
+                    Operator::GtEq,
+                    Operator::Lt,
+                    Operator::LtEq,
+                ],
+            },
+        );
+        map
+    }
+}
+
 impl EmployeeTableProvider {
     pub fn new() -> Self {
         // Define schema: id, name, department, age
@@ -244,7 +265,7 @@ impl TableProvider for EmployeeTableProvider {
         for filter in filters {
             if let Expr::BinaryExpr(expr) = filter {
                 if let (Expr::Column(col), Expr::Literal(value)) = (&*expr.left, &*expr.right) {
-                    if col.name == "age" {
+                    if self.supports_index_operator(&col.name, &expr.op) {
                         if let ScalarValue::Int32(Some(age_value)) = value {
                             filtered_indices =
                                 Some(self.age_index.filter_rows(&expr.op, *age_value));
@@ -286,18 +307,9 @@ impl TableProvider for EmployeeTableProvider {
         for filter in filters {
             if let Expr::BinaryExpr(expr) = *filter {
                 if let (Expr::Column(col), Expr::Literal(_)) = (&*expr.left, &*expr.right) {
-                    if col.name == "age" {
-                        match expr.op {
-                            Operator::Eq
-                            | Operator::Gt
-                            | Operator::GtEq
-                            | Operator::Lt
-                            | Operator::LtEq => {
-                                pushdown.push(TableProviderFilterPushDown::Exact);
-                                continue;
-                            }
-                            _ => {}
-                        }
+                    if self.supports_index_operator(&col.name, &expr.op) {
+                        pushdown.push(TableProviderFilterPushDown::Exact);
+                        continue;
                     }
                 }
             }

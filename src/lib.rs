@@ -1,13 +1,40 @@
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::datasource::TableProvider;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion_common::Result;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+/// Represents information about an indexed column
+#[derive(Debug, Clone)]
+pub struct IndexedColumn {
+    /// Name of the column that is indexed
+    pub name: String,
+    /// List of supported operators for this index
+    pub supported_operators: Vec<Operator>,
+}
+
+/// A provider that supports indexed column lookups
+#[async_trait]
+pub trait IndexProvider: TableProvider {
+    /// Returns a map of column names to their index information
+    fn get_indexed_columns(&self) -> HashMap<String, IndexedColumn>;
+
+    /// Returns whether a specific column and operator combination is supported by the index
+    fn supports_index_operator(&self, column: &str, op: &Operator) -> bool {
+        self.get_indexed_columns()
+            .get(column)
+            .map(|idx| idx.supported_operators.contains(op))
+            .unwrap_or(false)
+    }
+}
 
 #[async_trait]
 pub trait MapIndexWithRecord: Send + Sync {
