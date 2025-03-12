@@ -163,12 +163,42 @@ impl AgeIndex {
     }
 }
 
+/// A simple index structure that maps department values to row indices
+#[derive(Debug)]
+struct DepartmentIndex {
+    // Maps department to a vector of row indices
+    index: BTreeMap<String, Vec<usize>>,
+}
+
+impl DepartmentIndex {
+    fn new(departments: &StringArray) -> Self {
+        let mut index = BTreeMap::new();
+        for (i, department) in departments.iter().enumerate() {
+            if let Some(department) = department {
+                index
+                    .entry(department.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(i);
+            }
+        }
+        DepartmentIndex { index }
+    }
+
+    fn filter_rows(&self, op: &Operator, value: &str) -> Vec<usize> {
+        match op {
+            Operator::Eq => self.index.get(value).map_or(vec![], |rows| rows.clone()),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 /// A simple in-memory table provider that stores employee data with an age index
 #[derive(Debug)]
 pub struct EmployeeTableProvider {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
     age_index: AgeIndex,
+    department_index: DepartmentIndex,
 }
 
 #[async_trait]
@@ -186,6 +216,13 @@ impl IndexProvider for EmployeeTableProvider {
                     Operator::Lt,
                     Operator::LtEq,
                 ],
+            },
+        );
+        map.insert(
+            "department".to_string(),
+            IndexedColumn {
+                name: "department".to_string(),
+                supported_operators: vec![Operator::Eq],
             },
         );
         map
@@ -217,6 +254,9 @@ impl EmployeeTableProvider {
         // Create the age index
         let age_index = AgeIndex::new(&age_array);
 
+        // Create the department index
+        let department_index = DepartmentIndex::new(&department_array);
+
         // Create record batch
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -224,7 +264,7 @@ impl EmployeeTableProvider {
                 Arc::new(id_array),
                 Arc::new(name_array),
                 Arc::new(age_array.clone()),
-                Arc::new(department_array),
+                Arc::new(department_array.clone()),
             ],
         )
         .unwrap();
@@ -233,6 +273,7 @@ impl EmployeeTableProvider {
             schema,
             batches: vec![batch],
             age_index,
+            department_index,
         }
     }
 }
@@ -266,9 +307,22 @@ impl TableProvider for EmployeeTableProvider {
             if let Expr::BinaryExpr(expr) = filter {
                 if let (Expr::Column(col), Expr::Literal(value)) = (&*expr.left, &*expr.right) {
                     if self.supports_index_operator(&col.name, &expr.op) {
-                        if let ScalarValue::Int32(Some(age_value)) = value {
-                            filtered_indices =
-                                Some(self.age_index.filter_rows(&expr.op, *age_value));
+                        match col.name.as_str() {
+                            "age" => {
+                                if let ScalarValue::Int32(Some(age_value)) = value {
+                                    filtered_indices =
+                                        Some(self.age_index.filter_rows(&expr.op, *age_value));
+                                }
+                            }
+                            "department" => {
+                                if let ScalarValue::Utf8(Some(department_value)) = value {
+                                    filtered_indices = Some(
+                                        self.department_index
+                                            .filter_rows(&expr.op, department_value),
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -558,4 +612,32 @@ async fn test_employee_table_filter_age_between() {
     assert!(names.iter().any(|n| n == Some("David"))); // David is 28
     assert!(names.iter().any(|n| n == Some("Bob"))); // Bob is 30
     assert_eq!(names.len() as usize, 3);
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_department() -> Result<()> {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT * FROM employees WHERE department = 'Engineering'")
+        .await?;
+
+    let results = df.collect().await?;
+    let batch = &results[0];
+
+    assert_eq!(batch.num_rows(), 2);
+
+    let names: Vec<_> = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .collect();
+
+    // Should contain Alice and David who are in Engineering
+    assert!(names.contains(&Some("Alice")));
+    assert!(names.contains(&Some("David")));
+
+    Ok(())
 }
