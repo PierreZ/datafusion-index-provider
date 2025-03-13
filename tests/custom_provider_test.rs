@@ -162,6 +162,14 @@ impl AgeIndex {
             _ => unimplemented!(),
         }
     }
+
+    fn filter_rows_range(&self, low: i32, high: i32) -> Vec<usize> {
+        self.index
+            .range(low..=high)
+            .flat_map(|(_, rows)| rows)
+            .copied()
+            .collect()
+    }
 }
 
 /// A simple index structure that maps department values to row indices
@@ -222,62 +230,123 @@ pub struct EmployeeTableProvider {
 #[async_trait]
 impl IndexProvider for EmployeeTableProvider {
     fn get_indexed_columns(&self) -> HashMap<String, IndexedColumn> {
-        let mut map = HashMap::new();
-        map.insert(
+        let mut columns = HashMap::new();
+        columns.insert(
             "age".to_string(),
             IndexedColumn {
                 name: "age".to_string(),
                 supported_operators: vec![
                     Operator::Eq,
-                    Operator::Gt,
-                    Operator::GtEq,
                     Operator::Lt,
                     Operator::LtEq,
+                    Operator::Gt,
+                    Operator::GtEq,
                 ],
             },
         );
-        map.insert(
+        columns.insert(
             "department".to_string(),
             IndexedColumn {
                 name: "department".to_string(),
                 supported_operators: vec![Operator::Eq],
             },
         );
-        map
+        columns
+    }
+
+    fn optimize_exprs(&self, exprs: &[Expr]) -> Result<Vec<Expr>> {
+        // Group expressions by column
+        let mut column_exprs: HashMap<String, Vec<&Expr>> = HashMap::new();
+
+        for expr in exprs {
+            if let Expr::BinaryExpr(binary) = expr {
+                if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
+                    if self.supports_index_operator(&col.name, &binary.op) {
+                        column_exprs.entry(col.name.clone()).or_default().push(expr);
+                    }
+                }
+            }
+        }
+
+        // Process expressions for each column
+        let mut optimized = Vec::new();
+        for (col_name, col_exprs) in column_exprs {
+            if col_exprs.len() > 1 {
+                // Try to combine expressions into bounds
+                if let Some(combined) = try_combine_exprs_to_between(&col_exprs, &col_name) {
+                    optimized.extend(combined);
+                } else {
+                    // If we couldn't combine them, keep them as is
+                    optimized.extend(col_exprs.into_iter().cloned());
+                }
+            } else {
+                // For single expressions, keep them as is
+                optimized.extend(col_exprs.into_iter().cloned());
+            }
+        }
+
+        Ok(optimized)
     }
 
     fn create_index_lookup(&self, expr: &Expr) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if let Expr::BinaryExpr(binary) = expr {
-            if let (Expr::Column(col), Expr::Literal(value)) = (&*binary.left, &*binary.right) {
-                if !self.supports_index_operator(&col.name, &binary.op) {
-                    return Ok(None);
+        match expr {
+            Expr::BinaryExpr(binary) => {
+                if let (Expr::Column(col), Expr::Literal(value)) = (&*binary.left, &*binary.right) {
+                    if !self.supports_index_operator(&col.name, &binary.op) {
+                        return Ok(None);
+                    }
+
+                    let filtered_indices = match (col.name.as_str(), value) {
+                        ("age", ScalarValue::Int32(Some(age))) => {
+                            self.age_index.filter_rows(&binary.op, *age)
+                        }
+                        ("department", ScalarValue::Utf8(Some(dept))) => {
+                            self.department_index.filter_rows(&binary.op, dept)
+                        }
+                        _ => return Ok(None),
+                    };
+
+                    let index_schema = Arc::new(Schema::new(vec![Field::new(
+                        "index",
+                        DataType::UInt64,
+                        false,
+                    )]));
+
+                    Ok(Some(Arc::new(IndexLookupExec::new(
+                        index_schema,
+                        filtered_indices,
+                    ))))
+                } else {
+                    Ok(None)
                 }
+            }
+            Expr::Between(between) => {
+                if let Expr::Column(col) = between.expr.as_ref() {
+                    if let (
+                        Expr::Literal(ScalarValue::Int32(Some(low))),
+                        Expr::Literal(ScalarValue::Int32(Some(high))),
+                    ) = (between.low.as_ref(), between.high.as_ref())
+                    {
+                        if col.name == "age" {
+                            let filtered_indices: Vec<usize> =
+                                self.age_index.filter_rows_range(*low, *high);
 
-                let filtered_indices = match (col.name.as_str(), value) {
-                    ("age", ScalarValue::Int32(Some(age))) => {
-                        self.age_index.filter_rows(&binary.op, *age)
+                            let index_schema = Arc::new(Schema::new(vec![Field::new(
+                                "index",
+                                DataType::UInt64,
+                                false,
+                            )]));
+
+                            return Ok(Some(Arc::new(IndexLookupExec::new(
+                                index_schema,
+                                filtered_indices,
+                            ))));
+                        }
                     }
-                    ("department", ScalarValue::Utf8(Some(dept))) => {
-                        self.department_index.filter_rows(&binary.op, dept)
-                    }
-                    _ => return Ok(None),
-                };
-
-                let index_schema = Arc::new(Schema::new(vec![Field::new(
-                    "index",
-                    DataType::UInt64,
-                    false,
-                )]));
-
-                Ok(Some(Arc::new(IndexLookupExec::new(
-                    index_schema,
-                    filtered_indices,
-                ))))
-            } else {
+                }
                 Ok(None)
             }
-        } else {
-            Ok(None)
+            _ => Ok(None),
         }
     }
 
@@ -305,14 +374,17 @@ impl IndexProvider for EmployeeTableProvider {
                 )))
             }
             2 => {
-                // TODOs:
-                // - for index 1 and 2, create the index join exec
-                // - create a HashJoinExec with the index join exec with the two indexes
-                // - create a IndexLookupExec with the hashJoinExec as input
-                todo!()
+                // TODO: Handle multiple columns case with HashJoin
+                unimplemented!("Multiple columns not yet supported")
             }
             _ => unimplemented!(),
         }
+    }
+}
+
+impl Default for EmployeeTableProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -386,9 +458,14 @@ impl TableProvider for EmployeeTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // First optimize the expressions
+        let optimized_filters = self.optimize_exprs(filters)?;
+
+        log::debug!("Optimized filters: {:?}", optimized_filters);
+
         // Create index lookups for each optimized filter
         let mut lookups = Vec::new();
-        for filter in filters {
+        for filter in optimized_filters {
             if let Some(lookup) = self.create_index_lookup(&filter)? {
                 lookups.push(lookup);
             }
@@ -650,7 +727,7 @@ async fn test_employee_table_filter_age_between() {
         .unwrap();
     let results = df.collect().await.unwrap();
     let names = results[0]
-        .column(0) // name is first in projection
+        .column(1) // name is first in projection
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
