@@ -3,11 +3,14 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::logical_expr::{Expr, JoinType, Operator, TableProviderFilterPushDown};
+use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec, MemoryStream};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -23,7 +26,6 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use datafusion::catalog::Session;
-use datafusion::physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec, MemoryStream};
 
 fn compute_properties(schema: SchemaRef) -> PlanProperties {
     let eq_properties = EquivalenceProperties::new(schema);
@@ -97,6 +99,8 @@ impl ExecutionPlan for IndexLookupExec {
         let indices =
             UInt64Array::from_iter_values(self.filtered_indices.iter().map(|&i| i as u64));
         let batch = RecordBatch::try_new(self.schema.clone(), vec![Arc::new(indices)])?;
+
+        log::debug!("index lookup Batch: {:?}", batch);
 
         Ok(Box::pin(MemoryStream::try_new(
             vec![batch],
@@ -257,19 +261,25 @@ impl IndexProvider for EmployeeTableProvider {
     fn optimize_exprs(&self, exprs: &[Expr]) -> Result<Vec<Expr>> {
         // Group expressions by column
         let mut column_exprs: HashMap<String, Vec<&Expr>> = HashMap::new();
+        let mut optimized = Vec::new();
 
         for expr in exprs {
-            if let Expr::BinaryExpr(binary) = expr {
-                if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
-                    if self.supports_index_operator(&col.name, &binary.op) {
-                        column_exprs.entry(col.name.clone()).or_default().push(expr);
+            match expr {
+                Expr::BinaryExpr(binary) => {
+                    if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
+                        if self.supports_index_operator(&col.name, &binary.op) {
+                            column_exprs.entry(col.name.clone()).or_default().push(expr);
+                            continue;
+                        }
                     }
                 }
+                _ => {}
             }
+            // If not a binary expression or not supported by index, keep as is
+            optimized.push(expr.clone());
         }
 
         // Process expressions for each column
-        let mut optimized = Vec::new();
         for (col_name, col_exprs) in column_exprs {
             if col_exprs.len() > 1 {
                 // Try to combine expressions into bounds
@@ -374,10 +384,38 @@ impl IndexProvider for EmployeeTableProvider {
                 )))
             }
             2 => {
-                // TODO: Handle multiple columns case with HashJoin
-                unimplemented!("Multiple columns not yet supported")
+                // Handle multiple columns case with HashJoin
+                let left = lookups[0].clone();
+                let right = lookups[1].clone();
+
+                // Join on the index column which is present in both index results
+                let left_col = Arc::new(PhysicalColumn::new("index", 0)) as Arc<dyn PhysicalExpr>;
+                let right_col = Arc::new(PhysicalColumn::new("index", 0)) as Arc<dyn PhysicalExpr>;
+                let join_on = vec![(left_col, right_col)];
+
+                // Create HashJoinExec to join the index results
+                let join_exec = Arc::new(HashJoinExec::try_new(
+                    left,
+                    right,
+                    join_on,
+                    None,
+                    &JoinType::Inner,
+                    None, // No filter columns
+                    PartitionMode::CollectLeft,
+                    false,
+                )?);
+
+                // Join with the actual data using IndexJoinExec
+                Ok(Arc::new(IndexJoinExec::new(
+                    join_exec,
+                    self.batches.clone(),
+                    projection.cloned(),
+                    self.schema.clone(),
+                )))
             }
-            _ => unimplemented!(),
+            _ => Err(DataFusionError::NotImplemented(
+                "Joining more than 2 indices is not supported".to_string(),
+            )),
         }
     }
 }
@@ -510,6 +548,7 @@ impl BatchMapper {
 #[async_trait]
 impl MapIndexWithRecord for BatchMapper {
     async fn map_index_with_record(&mut self, index_batch: RecordBatch) -> Result<RecordBatch> {
+        log::debug!("Index batch: {:?}", index_batch);
         // Get row indices from the index batch
         let indices = index_batch
             .column(0)
@@ -517,6 +556,8 @@ impl MapIndexWithRecord for BatchMapper {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         let row_ids: Vec<usize> = indices.iter().flatten().map(|i| i as usize).collect();
+
+        log::debug!("Row ids: {:?}", row_ids);
 
         // Apply the row filter to get filtered batch
         apply_row_filter(&self.batches[0], &row_ids)
@@ -761,6 +802,114 @@ async fn test_employee_table_filter_department() -> Result<()> {
     // Should contain Alice and David who are in Engineering
     assert!(names.contains(&Some("Alice")));
     assert!(names.contains(&Some("David")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_age_and_department() -> Result<()> {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age, department FROM employees WHERE age = 25 AND department = 'Engineering'")
+        .await?;
+    let results = df.collect().await?;
+
+    let batch = &results[0];
+    let names = batch
+        .column_by_name("name")
+        .expect("should find column name")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let departments = batch
+        .column_by_name("department")
+        .expect("should find column department")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ages = batch
+        .column_by_name("age")
+        .expect("should find column age")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    // Check that all results match our criteria
+    for i in 0..batch.num_rows() {
+        assert_eq!(ages.value(i), 25, "Age should be 25");
+        assert_eq!(
+            departments.value(i),
+            "Engineering",
+            "Department should be Engineering"
+        );
+    }
+
+    // We expect only Alice who is 25 and in Engineering
+    assert_eq!(batch.num_rows(), 1, "Should find 1 employee");
+    assert!(names.iter().any(|n| n == Some("Alice")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_age_greater_than_20_and_department() -> Result<()> {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age, department FROM employees WHERE age > 20 AND department = 'Engineering'")
+        .await?;
+    let results = df.collect().await?;
+
+    let batch = &results[0];
+    let names = batch
+        .column_by_name("name")
+        .expect("should find column name")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let departments = batch
+        .column_by_name("department")
+        .expect("should find column department")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ages = batch
+        .column_by_name("age")
+        .expect("should find column age")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    // Check that all results match our criteria
+    for i in 0..batch.num_rows() {
+        assert!(ages.value(i) > 20, "Age should be > 20");
+        assert_eq!(
+            departments.value(i),
+            "Engineering",
+            "Department should be Engineering"
+        );
+    }
+
+    // We expect Alice (age 25) and David (age 28) who are both in Engineering
+    assert_eq!(batch.num_rows(), 2, "Should find 2 employees");
+    assert!(names.iter().any(|n| n == Some("Alice")));
+    assert!(names.iter().any(|n| n == Some("David")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_no_matches() -> Result<()> {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age, department FROM employees WHERE age > 40 AND department = 'Engineering'")
+        .await?;
+    let results = df.collect().await?;
+
+    // We expect no results since no one is over 40 in Engineering
+    assert_eq!(results.len(), 0, "Should find 0 employees");
 
     Ok(())
 }
