@@ -16,13 +16,14 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_index_provider::*;
+use parking_lot::RwLock;
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use datafusion::catalog::Session;
-use datafusion::physical_plan::memory::{LazyMemoryExec, MemoryStream};
+use datafusion::physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec, MemoryStream};
 
 fn compute_properties(schema: SchemaRef) -> PlanProperties {
     let eq_properties = EquivalenceProperties::new(schema);
@@ -192,6 +193,23 @@ impl DepartmentIndex {
     }
 }
 
+#[derive(Debug)]
+pub struct NotSoLazyBatchGenerator {
+    data: Vec<RecordBatch>,
+}
+
+impl std::fmt::Display for NotSoLazyBatchGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NotSoLazyBatchGenerator")
+    }
+}
+
+impl LazyBatchGenerator for NotSoLazyBatchGenerator {
+    fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        Ok(self.data.pop())
+    }
+}
+
 /// A simple in-memory table provider that stores employee data with an age index
 #[derive(Debug)]
 pub struct EmployeeTableProvider {
@@ -270,7 +288,12 @@ impl IndexProvider for EmployeeTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match lookups.len() {
             0 => {
-                unimplemented!("create a LazyMemoryExec with all the batches")
+                let data = self.batches.clone();
+                let schema = self.schema.clone();
+
+                let generator = Arc::new(RwLock::new(NotSoLazyBatchGenerator { data }));
+
+                Ok(Arc::new(LazyMemoryExec::try_new(schema, vec![generator])?))
             }
             1 => {
                 // Single index - use IndexJoinExec
@@ -363,10 +386,10 @@ impl TableProvider for EmployeeTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Create index lookups for each filter that can use an index
+        // Create index lookups for each optimized filter
         let mut lookups = Vec::new();
         for filter in filters {
-            if let Some(lookup) = self.create_index_lookup(filter)? {
+            if let Some(lookup) = self.create_index_lookup(&filter)? {
                 lookups.push(lookup);
             }
         }
@@ -617,26 +640,25 @@ async fn test_employee_table_filter_age_exact() {
     assert_eq!(names.len() as usize, 1);
 }
 
-// TODO: fix the test by adding some optmizer rules to undo the BETWEEN operator that has been rewrite as two exprs
-// #[tokio::test]
-// async fn test_employee_table_filter_age_between() {
-//     let ctx = setup_test_env().await;
+#[tokio::test]
+async fn test_employee_table_filter_age_between() {
+    let ctx = setup_test_env().await;
 
-//     let df = ctx
-//         .sql("SELECT name, age FROM employees WHERE age BETWEEN 25 AND 30")
-//         .await
-//         .unwrap();
-//     let results = df.collect().await.unwrap();
-//     let names = results[0]
-//         .column(1)
-//         .as_any()
-//         .downcast_ref::<StringArray>()
-//         .unwrap();
-//     assert!(names.iter().any(|n| n == Some("Alice"))); // Alice is 25
-//     assert!(names.iter().any(|n| n == Some("David"))); // David is 28
-//     assert!(names.iter().any(|n| n == Some("Bob"))); // Bob is 30
-//     assert_eq!(names.len() as usize, 3);
-// }
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age BETWEEN 25 AND 30")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    let names = results[0]
+        .column(0) // name is first in projection
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(names.iter().any(|n| n == Some("Alice"))); // Alice is 25
+    assert!(names.iter().any(|n| n == Some("David"))); // David is 28
+    assert!(names.iter().any(|n| n == Some("Bob"))); // Bob is 30
+    assert_eq!(names.len(), 3);
+}
 
 #[tokio::test]
 async fn test_employee_table_filter_department() -> Result<()> {
