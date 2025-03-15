@@ -1,4 +1,5 @@
 use crate::physical_plan::Index;
+use crate::types::{IndexFilter, IndexFilters};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result;
@@ -22,10 +23,7 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     /// Analyzes filters, optimizes them, and groups them by the index that can handle them.
     /// Default implementing is only using the column to find the index.
     /// Returns a tuple of (optimized filters, remaining filters).
-    fn analyze_and_optimize_filters(
-        &self,
-        filters: &[Expr],
-    ) -> Result<(Vec<(Arc<dyn Index>, Vec<Expr>)>, Vec<Expr>)> {
+    fn analyze_and_optimize_filters(&self, filters: &[Expr]) -> Result<(IndexFilters, Vec<Expr>)> {
         let indexes = self.indexes()?;
         let mut indexed_filters: HashMap<String, (Arc<dyn Index>, Vec<Expr>)> = HashMap::new();
         let mut remaining_filters = Vec::new();
@@ -82,7 +80,7 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-        indexes: &Vec<(Arc<dyn Index>, Vec<Expr>)>,
+        indexes: &[IndexFilter],
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Builds an ExecutionPlan to scan the table.
@@ -296,7 +294,7 @@ mod tests {
             _projection: Option<&Vec<usize>>,
             _filters: &[Expr],
             _limit: Option<usize>,
-            _indexes: &Vec<(Arc<dyn Index>, Vec<Expr>)>,
+            _indexes: &[IndexFilter],
         ) -> Result<Arc<dyn ExecutionPlan>> {
             *self.scanned_with_indexes.lock().unwrap() = true;
             Ok(Arc::new(MockExec))

@@ -211,8 +211,7 @@ mod tests {
                 assert!(
                     e.to_string()
                         .contains("IndexScanExec only supports a single partition"),
-                    "unexpected error message: {}",
-                    e
+                    "unexpected error message: {e}"
                 );
             }
             Ok(_) => panic!("expected an error"),

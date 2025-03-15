@@ -2,8 +2,21 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::physical_plan::{fetcher::RecordFetcher, Index};
-use datafusion::{physical_plan::PlanProperties, prelude::Expr};
+use datafusion::common::Statistics;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::TaskContext;
+use datafusion::execution::SendableRecordBatchStream;
+use futures::FutureExt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
+};
+use futures::stream::{Stream, StreamExt};
 
 use crate::physical_plan::exec::index::IndexScanExec;
 use crate::physical_plan::fetcher::RecordFetcher;
@@ -13,7 +26,7 @@ use crate::types::IndexFilters;
 /// A physical plan to fetch records from an index.
 #[derive(Debug)]
 pub struct RecordFetchExec {
-    indexes: Arc<Vec<(Arc<dyn Index>, Vec<Expr>)>>,
+    indexes: Arc<IndexFilters>,
     limit: Option<usize>,
     plan_properties: PlanProperties,
     record_fetcher: Arc<Box<dyn RecordFetcher>>,
@@ -24,7 +37,7 @@ pub struct RecordFetchExec {
 
 impl RecordFetchExec {
     pub fn try_new(
-        indexes: Arc<Vec<(Arc<dyn Index>, Vec<Expr>)>>,
+        indexes: Arc<IndexFilters>,
         limit: Option<usize>,
         record_fetcher: Box<dyn RecordFetcher>,
     ) -> Result<Self> {
@@ -53,7 +66,7 @@ impl RecordFetchExec {
     }
 
     fn build_input_plan(
-        indexes: Arc<Vec<(Arc<dyn Index>, Vec<Expr>)>>,
+        indexes: Arc<IndexFilters>,
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut plans = indexes
@@ -227,6 +240,7 @@ impl RecordBatchStream for RecordFetchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::physical_plan::Index;
     use crate::physical_plan::ROW_ID_COLUMN_NAME;
     use arrow::array::UInt64Array;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -375,8 +389,7 @@ mod tests {
         let err = RecordFetchExec::try_new(indexes, None, fetcher).unwrap_err();
         assert!(
             matches!(err, DataFusionError::Plan(ref msg) if msg == "RecordFetchExec requires at least one index"),
-            "Unexpected error: {:?}",
-            err
+            "Unexpected error: {err:?}"
         );
     }
 
@@ -387,8 +400,7 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1, 3])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes: Arc<Vec<(Arc<dyn Index>, Vec<Expr>)>> =
-            Arc::new(vec![(index.clone() as Arc<dyn Index>, vec![])]);
+        let indexes: Arc<IndexFilters> = Arc::new(vec![(index.clone() as Arc<dyn Index>, vec![])]);
 
         let fetcher = Box::new(MockRecordFetcher::new());
         let exec = RecordFetchExec::try_new(indexes, None, fetcher)?;
@@ -413,7 +425,7 @@ mod tests {
         )])?;
         let index2 = Arc::new(MockIndex::new(vec![index2_batch]));
 
-        let indexes: Arc<Vec<(Arc<dyn Index>, Vec<Expr>)>> = Arc::new(vec![
+        let indexes: Arc<IndexFilters> = Arc::new(vec![
             (index1 as Arc<dyn Index>, vec![]),
             (index2 as Arc<dyn Index>, vec![]),
         ]);
