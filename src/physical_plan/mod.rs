@@ -34,9 +34,9 @@ use std::sync::Arc;
 pub fn create_plan_properties_for_row_id_scan(schema: SchemaRef, ordered: bool) -> PlanProperties {
     let mut eq_properties = EquivalenceProperties::new(schema);
     if ordered {
-        let sort_expr = PhysicalSortExpr::new_default(Arc::new(
-            PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0),
-        )).asc();
+        let sort_expr =
+            PhysicalSortExpr::new_default(Arc::new(PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0)))
+                .asc();
         eq_properties.add_ordering(vec![sort_expr]);
     }
     PlanProperties::new(

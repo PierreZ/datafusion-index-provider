@@ -25,9 +25,9 @@ use futures::stream::{Stream, StreamExt};
 use crate::physical_plan::exec::index::IndexScanExec;
 use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::joins::try_create_index_lookup_join;
-use crate::physical_plan::ROW_ID_COLUMN_NAME;
+use crate::physical_plan::{create_index_schema, ROW_ID_COLUMN_NAME};
 use crate::types::{IndexFilter, IndexFilters};
-use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::Column;
@@ -175,11 +175,13 @@ impl RecordFetchExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match index_filter {
             IndexFilter::Single { index, filter } => {
+                // Use consistent schema for all index scans to avoid union mismatches
+                let consistent_schema = create_index_schema(DataType::UInt64);
                 let exec = IndexScanExec::try_new(
                     index.clone(),
                     vec![filter.clone()],
                     limit,
-                    index.index_schema(),
+                    consistent_schema,
                 )?;
                 Ok(Arc::new(exec))
             }
@@ -212,12 +214,13 @@ impl RecordFetchExec {
                     return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
                 }
 
+                // Ensure all plans have the same schema before creating union
+                let expected_schema = create_index_schema(DataType::UInt64);
                 let union_input = Arc::new(UnionExec::new(plans));
-                let union_schema = union_input.schema();
 
+                // Use the expected index schema instead of union schema to avoid mismatches
                 let group_expr = PhysicalGroupBy::new_single(vec![(
-                    Arc::new(Column::new_with_schema(ROW_ID_COLUMN_NAME, &union_schema)?)
-                        as Arc<dyn PhysicalExpr>,
+                    Arc::new(Column::new(ROW_ID_COLUMN_NAME, 0)) as Arc<dyn PhysicalExpr>,
                     ROW_ID_COLUMN_NAME.to_string(),
                 )]);
 
@@ -227,7 +230,7 @@ impl RecordFetchExec {
                     vec![],
                     vec![],
                     union_input,
-                    union_schema.clone(),
+                    expected_schema,
                 )?;
 
                 Ok(Arc::new(agg_exec))

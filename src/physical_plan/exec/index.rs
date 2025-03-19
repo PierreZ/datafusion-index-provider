@@ -53,8 +53,10 @@ impl DisplayAs for IndexScanExec {
             | DisplayFormatType::TreeRender => {
                 write!(f, "IndexScanExec: index={}, filters=[", self.index.name())?;
                 for (i, filter) in self.filters.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
-                    write!(f, "{}", filter)?;
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{filter}")?;
                 }
                 write!(f, "], limit={:?}", self.limit)
             }

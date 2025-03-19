@@ -67,7 +67,7 @@ impl fmt::Display for IndexFilter {
                     if i > 0 {
                         write!(f, " AND ")?;
                     }
-                    write!(f, "{}", filter)?;
+                    write!(f, "{filter}")?;
                 }
                 write!(f, ")")
             }
@@ -77,7 +77,7 @@ impl fmt::Display for IndexFilter {
                     if i > 0 {
                         write!(f, " OR ")?;
                     }
-                    write!(f, "{}", filter)?;
+                    write!(f, "{filter}")?;
                 }
                 write!(f, ")")
             }

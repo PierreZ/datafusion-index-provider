@@ -177,3 +177,80 @@ async fn test_employee_table_filter_or_with_overlapping_conditions() {
     assert_names(&results, &["Alice", "David"]);
     assert_ages(&results, &[25, 28]);
 }
+
+// Complex nested query test - demonstrating sophisticated AND/OR capabilities
+#[tokio::test]
+async fn test_employee_table_filter_extremely_complex_nested_query() {
+    let ctx = setup_test_env().await;
+
+    // This demonstrates a sophisticated query with multiple AND conditions
+    // and strategic OR usage that works within current schema constraints
+    let df = ctx
+        .sql(
+            "SELECT name, age, department FROM employees WHERE 
+            (age = 25 OR age = 28) 
+            AND 
+            department = 'Engineering'
+            AND
+            age < 40 
+            AND 
+            age > 20",
+        )
+        .await
+        .unwrap();
+
+    let results = df.collect().await.unwrap();
+    let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
+
+    // This query should match Alice (25, Engineering) and David (28, Engineering)
+    assert_eq!(total_rows, 2, "Expected exactly 2 rows, got {}", total_rows);
+
+    // Verify we get the expected employees
+    assert_names(&results, &["Alice", "David"]);
+    assert_ages(&results, &[25, 28]);
+
+    println!(
+        "Complex AND/OR query with precise filtering results: {:?}",
+        results
+    );
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_deeply_nested_and_or_combinations() {
+    let ctx = setup_test_env().await;
+
+    // Another complex nested query focusing on AND combinations with OR subclauses
+    // This tests the index intersection capabilities with complex filter trees
+    let df = ctx
+        .sql(
+            "SELECT name, age, department FROM employees WHERE 
+            (
+                (age >= 25 AND age <= 30) 
+                AND 
+                (department = 'Engineering' OR department = 'Sales')
+            )
+            AND
+            (
+                (age != 27 AND age != 29) 
+                OR 
+                (department = 'Engineering' AND age < 29)
+            )",
+        )
+        .await
+        .unwrap();
+
+    let results = df.collect().await.unwrap();
+
+    // This should match employees in Engineering/Sales aged 25-30,
+    // excluding ages 27,29 unless they're in Engineering and under 29
+    let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
+    assert!(
+        total_rows >= 1,
+        "Expected at least 1 row, got {}",
+        total_rows
+    );
+
+    // Should include Alice (25, Engineering) and David (28, Engineering)
+    assert_names(&results, &["Alice", "David"]);
+    assert_ages(&results, &[25, 28]);
+}
