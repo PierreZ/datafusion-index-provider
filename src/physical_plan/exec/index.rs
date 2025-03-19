@@ -1,11 +1,15 @@
-use crate::physical_plan::{create_plan_properties_for_row_id_scan, Index};
+use crate::physical_plan::Index;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::{
-    execution::{SendableRecordBatchStream, TaskContext},
-    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties},
-    prelude::Expr,
+use datafusion::error::DataFusionError;
+use datafusion::execution::TaskContext;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::Boundedness;
+use datafusion::physical_plan::expressions::{Column, PhysicalSortExpr};
+use datafusion::physical_plan::{
+    execution_plan::EmissionType, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+    PlanProperties, SendableRecordBatchStream,
 };
-use datafusion_common::DataFusionError;
 use std::sync::Arc;
 
 /// Physical plan node for scanning an [`Index`].
@@ -31,15 +35,16 @@ impl DisplayAs for IndexScanExec {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default => write!(f, "IndexScanExec: index={}", self.index.name()),
-            DisplayFormatType::Verbose => write!(
-                f,
-                "IndexScanExec: index={}, filters={:?}, limit={:?}",
-                self.index.name(),
-                self.filters,
-                self.limit
-            ),
-            DisplayFormatType::TreeRender => write!(f, "IndexScanExec"),
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+                let filters: Vec<_> = self.filters.iter().map(|f| f.to_string()).collect();
+                write!(
+                    f,
+                    "IndexScanExec: index={}, filters=[{}], limit={:?}",
+                    self.index.name(),
+                    filters.join(", "),
+                    self.limit
+                )
+            }
         }
     }
 }
@@ -102,8 +107,23 @@ impl IndexScanExec {
         limit: Option<usize>,
         schema: SchemaRef,
     ) -> Result<Self, DataFusionError> {
-        let plan_properties =
-            create_plan_properties_for_row_id_scan(schema.clone(), index.is_ordered());
+        let ordering = if index.is_ordered() {
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema("__row_id__", &schema)?),
+                options: Default::default(),
+            }]
+        } else {
+            vec![]
+        };
+        let eq = EquivalenceProperties::new_with_orderings(schema.clone(), [ordering]);
+
+        let plan_properties = PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+
         Ok(Self {
             index,
             filters,

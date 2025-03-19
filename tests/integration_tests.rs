@@ -102,3 +102,79 @@ async fn test_employee_table_filter_age_and_department() {
     assert_names(&results, &["Alice", "David"]);
     assert_ages(&results, &[25, 28]);
 }
+
+#[tokio::test]
+async fn test_employee_table_filter_age_or_department() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age <= 30 OR department = 'Engineering'")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    assert_names(&results, &["Alice", "Bob", "David"]);
+    assert_ages(&results, &[25, 30, 28]);
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_multiple_or_on_age() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age = 25 OR age = 35 OR age = 32")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    assert_names(&results, &["Alice", "Charlie", "Eve"]);
+    assert_ages(&results, &[25, 35, 32]);
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_multiple_or_on_age_unique() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age < 30 OR age > 30")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    assert_names(&results, &["Alice", "Charlie", "David", "Eve"]);
+    assert_ages(&results, &[25, 35, 28, 32]);
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_complex_query() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql(
+            "SELECT name, age FROM employees WHERE (age < 30 AND department = 'Engineering') OR (age > 30 AND department = 'Sales')",
+        )
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    assert_names(&results, &["Alice", "David", "Eve"]);
+    assert_ages(&results, &[25, 28, 32]);
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_or_with_overlapping_conditions() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age = 25 OR age < 29")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+
+    let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
+    assert_eq!(
+        total_rows, 2,
+        "Expected 2 rows after deduplication, but found {}",
+        total_rows
+    );
+
+    assert_names(&results, &["Alice", "David"]);
+    assert_ages(&results, &[25, 28]);
+    assert!(false);
+}

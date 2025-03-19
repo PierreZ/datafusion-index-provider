@@ -17,14 +17,22 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, RecordBatchStream,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
+    RecordBatchStream,
 };
 use futures::stream::{Stream, StreamExt};
 
 use crate::physical_plan::exec::index::IndexScanExec;
 use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::joins::try_create_index_lookup_join;
+use crate::physical_plan::ROW_ID_COLUMN_NAME;
 use crate::types::{IndexFilter, IndexFilters};
+use datafusion::arrow::datatypes::Schema;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::PhysicalExpr;
 
 /// Physical plan node for fetching records from a [`RecordFetcher`] using
 /// row IDs produced by one or more index scans.
@@ -58,11 +66,24 @@ impl RecordFetchExec {
             ));
         }
 
-        let input = Self::build_input_plan(&indexes, limit)?;
+        if indexes.len() > 1 {
+            return Err(DataFusionError::Internal(
+                "RecordFetchExec expects a single root IndexFilter".to_string(),
+            ));
+        }
+
+        let input = match indexes.first() {
+            Some(index_filter) => Self::build_scan_exec(index_filter, limit)?,
+            None => {
+                return Err(DataFusionError::Plan(
+                    "RecordFetchExec requires at least one index".to_string(),
+                ));
+            }
+        };
         let eq_properties = EquivalenceProperties::new(schema.clone());
         let plan_properties = PlanProperties::new(
             eq_properties,
-            input.properties().output_partitioning().clone(),
+            Partitioning::UnknownPartitioning(1),
             input.properties().emission_type,
             input.properties().boundedness,
         );
@@ -83,41 +104,78 @@ impl RecordFetchExec {
     /// If there is a single index, the input plan is an `IndexScanExec`.
     /// If there are multiple indexes, the input plans are `IndexScanExec`s joined
     /// together using `IndexLookupJoin`s.
-    fn build_input_plan(
-        indexes: &IndexFilters,
+    fn build_scan_exec(
+        index_filter: &IndexFilter,
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut plans = indexes
-            .iter()
-            .map(|index_filter| -> Result<Arc<dyn ExecutionPlan>> {
-                Ok(Arc::new(IndexScanExec::try_new(
-                    index_filter.index.clone(),
-                    index_filter.filters.clone(),
+        match index_filter {
+            IndexFilter::Single { index, filter } => {
+                let exec = IndexScanExec::try_new(
+                    index.clone(),
+                    vec![filter.clone()],
                     limit,
-                    index_filter.index.index_schema(),
-                )?))
-            })
-            .collect::<Result<Vec<Arc<dyn ExecutionPlan>>>>()?;
+                    index.index_schema(),
+                )?;
+                Ok(Arc::new(exec))
+            }
+            IndexFilter::And(filters) => {
+                let mut plans = filters
+                    .iter()
+                    .map(|f| Self::build_scan_exec(f, limit))
+                    .collect::<Result<Vec<_>>>()?;
 
-        if plans.len() == 1 {
-            return Ok(plans.remove(0));
+                if plans.is_empty() {
+                    return Err(DataFusionError::Plan(
+                        "IndexFilter::And requires at least one sub-filter".to_string(),
+                    ));
+                }
+
+                let mut left = plans.remove(0);
+                while !plans.is_empty() {
+                    let right = plans.remove(0);
+                    left = try_create_index_lookup_join(left, right)?;
+                }
+                Ok(left)
+            }
+            IndexFilter::Or(filters) => {
+                let plans = filters
+                    .iter()
+                    .map(|f| Self::build_scan_exec(f, limit))
+                    .collect::<Result<Vec<_>>>()?;
+
+                if plans.is_empty() {
+                    return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
+                }
+
+                let union_input = Arc::new(UnionExec::new(plans));
+                let union_schema = union_input.schema();
+
+                let group_expr = PhysicalGroupBy::new_single(vec![(
+                    Arc::new(Column::new_with_schema(ROW_ID_COLUMN_NAME, &union_schema)?)
+                        as Arc<dyn PhysicalExpr>,
+                    ROW_ID_COLUMN_NAME.to_string(),
+                )]);
+
+                let agg_exec = AggregateExec::try_new(
+                    AggregateMode::Single,
+                    group_expr,
+                    vec![],
+                    vec![],
+                    union_input,
+                    union_schema.clone(),
+                )?;
+
+                Ok(Arc::new(agg_exec))
+            }
         }
-
-        let mut left = plans.remove(0);
-        while !plans.is_empty() {
-            let right = plans.remove(0);
-            left = try_create_index_lookup_join(left, right)?;
-        }
-
-        Ok(left)
     }
 }
 
 impl DisplayAs for RecordFetchExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let index_names: Vec<_> = self.indexes.iter().map(|i| i.index.name()).collect();
+            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+                let index_names: Vec<_> = self.indexes.iter().map(|i| i.to_string()).collect();
                 write!(
                     f,
                     "RecordFetchExec: indexes=[{}], limit={:?}",
@@ -125,7 +183,6 @@ impl DisplayAs for RecordFetchExec {
                     self.limit
                 )
             }
-            DisplayFormatType::TreeRender => write!(f, "RecordFetchExec"),
         }
     }
 }
@@ -158,6 +215,8 @@ impl ExecutionPlan for RecordFetchExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
+        // RecordFetchExec requires a single partition input because it merges
+        // results from multiple index scans.
         vec![Distribution::SinglePartition]
     }
 
@@ -188,7 +247,13 @@ impl ExecutionPlan for RecordFetchExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "RecordFetchExec executed with partition {partition} but expected 0"
+            )));
+        }
+
+        let input_stream = self.input.execute(0, context)?;
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
 
         Ok(Box::pin(RecordFetchStream::new(
@@ -396,6 +461,7 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::Statistics;
     use datafusion::logical_expr::Expr;
+    use datafusion::logical_expr::{col, lit};
     use datafusion::physical_plan::joins::HashJoinExec;
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
@@ -803,9 +869,9 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1, 3])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes: Vec<IndexFilter> = vec![IndexFilter {
+        let indexes: Vec<IndexFilter> = vec![IndexFilter::Single {
             index: index.clone() as Arc<dyn Index>,
-            filters: vec![],
+            filter: col("a").eq(lit(1)),
         }];
 
         let fetcher = Arc::new(MockRecordFetcher::new());
@@ -831,16 +897,16 @@ mod tests {
         )])?;
         let index2 = Arc::new(MockIndex::new(vec![index2_batch]));
 
-        let indexes = vec![
-            IndexFilter {
+        let indexes = vec![IndexFilter::And(vec![
+            IndexFilter::Single {
                 index: index1,
-                filters: vec![],
+                filter: col("a").eq(lit(1)),
             },
-            IndexFilter {
+            IndexFilter::Single {
                 index: index2,
-                filters: vec![],
+                filter: col("a").eq(lit(1)),
             },
-        ];
+        ])];
 
         let fetcher = Arc::new(MockRecordFetcher::new());
         let exec = RecordFetchExec::try_new(indexes, None, fetcher, Arc::new(Schema::empty()))?;
@@ -858,13 +924,13 @@ mod tests {
                 ROW_ID_COLUMN_NAME,
                 Arc::new(UInt64Array::from(vec![i, i + 1, i + 2])) as _,
             )])?;
-            indexes_vec.push(IndexFilter {
+            indexes_vec.push(IndexFilter::Single {
                 index: Arc::new(MockIndex::new(vec![batch])) as Arc<dyn Index>,
-                filters: vec![],
+                filter: col("a").eq(lit(1)),
             });
         }
 
-        let indexes = indexes_vec;
+        let indexes = vec![IndexFilter::And(indexes_vec)];
         let fetcher = Arc::new(MockRecordFetcher::new());
         let exec = RecordFetchExec::try_new(indexes, None, fetcher, Arc::new(Schema::empty()))?;
 
@@ -893,9 +959,9 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1, 3, 5])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes = vec![IndexFilter {
+        let indexes = vec![IndexFilter::Single {
             index: index.clone() as Arc<dyn Index>,
-            filters: vec![],
+            filter: col("a").eq(lit(1)),
         }];
 
         let fetcher = Arc::new(MockRecordFetcher::new().with_data());
@@ -932,9 +998,9 @@ mod tests {
     async fn test_record_fetch_exec_execute_empty_input() -> Result<()> {
         // 1. Setup mocks with no batches
         let index = Arc::new(MockIndex::new(vec![]));
-        let indexes = vec![IndexFilter {
+        let indexes = vec![IndexFilter::Single {
             index: index.clone() as Arc<dyn Index>,
-            filters: vec![],
+            filter: col("a").eq(lit(1)),
         }];
         let fetcher = Arc::new(MockRecordFetcher::new().with_data());
 
@@ -967,9 +1033,9 @@ mod tests {
             Arc::new(UInt64Array::from(vec![5, 7])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![batch1, batch2]));
-        let indexes = vec![IndexFilter {
+        let indexes = vec![IndexFilter::Single {
             index: index.clone() as Arc<dyn Index>,
-            filters: vec![],
+            filter: col("a").eq(lit(1)),
         }];
         let fetcher = Arc::new(MockRecordFetcher::new().with_data());
         let schema = fetcher.schema();
@@ -1025,9 +1091,9 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes = vec![IndexFilter {
+        let indexes = vec![IndexFilter::Single {
             index: index.clone() as Arc<dyn Index>,
-            filters: vec![],
+            filter: col("a").eq(lit(1)),
         }];
         let fetcher = Arc::new(ErrorFetcher);
 

@@ -6,9 +6,8 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use datafusion::error::Result;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A table provider that can be scanned using indexes.
@@ -35,34 +34,71 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     ///   expressions that can be handled by that index.
     /// - A list of expressions that cannot be handled by any index.
     fn analyze_and_optimize_filters(&self, filters: &[Expr]) -> Result<(IndexFilters, Vec<Expr>)> {
-        let indexes = self.indexes()?;
-        let mut indexed_filters: HashMap<String, IndexFilter> = HashMap::new();
+        let mut indexed_filters = Vec::new();
         let mut remaining_filters = Vec::new();
 
-        for filter in filters {
-            let mut found_index_for_filter = false;
-            for index in &indexes {
-                if index.supports_predicate(filter)? {
-                    let entry = indexed_filters
-                        .entry(index.name().to_string())
-                        .or_insert_with(|| IndexFilter {
-                            index: index.clone(),
-                            filters: Vec::new(),
-                        });
-                    entry.filters.push(filter.clone());
-                    found_index_for_filter = true;
-                    break;
-                }
-            }
-
-            if !found_index_for_filter {
-                remaining_filters.push(filter.clone());
+        for expr in filters {
+            if let Some(index_filter) = self.build_index_filter(expr)? {
+                indexed_filters.push(index_filter);
+            } else {
+                remaining_filters.push(expr.clone());
             }
         }
 
-        let optimized_filters = indexed_filters.into_values().collect();
+        let final_filters = if indexed_filters.len() > 1 {
+            vec![IndexFilter::And(indexed_filters)]
+        } else {
+            indexed_filters
+        };
 
-        Ok((optimized_filters, remaining_filters))
+        Ok((final_filters, remaining_filters))
+    }
+
+    /// Recursively builds an `IndexFilter` tree from a given expression.
+    ///
+    /// This method traverses the expression tree and attempts to create a corresponding
+    /// tree of `IndexFilter`s. If any part of the expression cannot be handled by an
+    /// index, this method returns `Ok(None)`.
+    fn build_index_filter(&self, expr: &Expr) -> Result<Option<IndexFilter>> {
+        // Recursive step for AND/OR operators.
+        if let Expr::BinaryExpr(be) = expr {
+            let op = match be.op {
+                Operator::And => |l, r| Ok(Some(IndexFilter::And(vec![l, r]))),
+                Operator::Or => |l, r| Ok(Some(IndexFilter::Or(vec![l, r]))),
+                _ => {
+                    // Not an AND/OR, so treat as a base case.
+                    return self.find_index_for_expr(expr);
+                }
+            };
+
+            // Recursively build filters for the left and right sides.
+            let l_filter = self.build_index_filter(be.left.as_ref())?;
+            let r_filter = self.build_index_filter(be.right.as_ref())?;
+
+            // If both sides are indexable, combine them.
+            if let (Some(l), Some(r)) = (l_filter, r_filter) {
+                return op(l, r);
+            } else {
+                // One or both sides are not indexable, so the whole expression is not.
+                return Ok(None);
+            }
+        }
+
+        // Base case for simple expressions (not AND/OR).
+        self.find_index_for_expr(expr)
+    }
+
+    /// Finds a suitable index for a simple expression.
+    fn find_index_for_expr(&self, expr: &Expr) -> Result<Option<IndexFilter>> {
+        for index in self.indexes()? {
+            if index.supports_predicate(expr)? {
+                return Ok(Some(IndexFilter::Single {
+                    index,
+                    filter: expr.clone(),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// Returns whether the filters can be pushed down to the index.
@@ -280,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_and_optimize_filters() -> Result<()> {
+    fn test_analyze_simple_pushdown() -> Result<()> {
         let provider = MockTableProvider::new(vec![Arc::new(MockIndex {
             column_name: "a".into(),
             table_name: "t".into(),
@@ -288,30 +324,30 @@ mod tests {
         let filters = vec![col("a").eq(lit(1))];
         let (indexed, remaining) = provider.analyze_and_optimize_filters(&filters)?;
 
-        assert_eq!(
-            indexed.len(),
-            1,
-            "Expected 1 indexed filter, got {}",
-            indexed.len()
-        );
-        assert_eq!(
-            indexed[0].filters.len(),
-            1,
-            "Expected 1 indexed filter, got {}",
-            indexed[0].filters.len()
-        );
-        assert_eq!(
-            remaining.len(),
-            0,
-            "Expected 0 remaining filters, got {}",
-            remaining.len()
-        );
+        assert_eq!(indexed.len(), 1);
+        assert!(matches!(indexed[0], IndexFilter::Single { .. }));
+        assert_eq!(remaining.len(), 0);
 
         Ok(())
     }
 
     #[test]
-    fn test_analyze_and_optimize_filters_with_multiple_filters() -> Result<()> {
+    fn test_analyze_no_pushdown() -> Result<()> {
+        let provider = MockTableProvider::new(vec![Arc::new(MockIndex {
+            column_name: "a".into(),
+            table_name: "t".into(),
+        })]);
+        let filters = vec![col("b").eq(lit(1))];
+        let (indexed, remaining) = provider.analyze_and_optimize_filters(&filters)?;
+
+        assert_eq!(indexed.len(), 0);
+        assert_eq!(remaining.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_mixed_pushdown() -> Result<()> {
         let provider = MockTableProvider::new(vec![Arc::new(MockIndex {
             column_name: "a".into(),
             table_name: "t".into(),
@@ -319,40 +355,68 @@ mod tests {
         let filters = vec![col("a").eq(lit(1)), col("b").eq(lit(2))];
         let (indexed, remaining) = provider.analyze_and_optimize_filters(&filters)?;
 
-        assert_eq!(
-            indexed.len(),
-            1,
-            "Expected 1 indexed filter group, got {}",
-            indexed.len()
-        );
-        assert_eq!(
-            indexed[0].filters.len(),
-            1,
-            "Expected 1 filter in group, got {}",
-            indexed[0].filters.len()
-        );
-        assert_eq!(
-            remaining.len(),
-            1,
-            "Expected 1 remaining filter, got {}",
-            remaining.len()
-        );
+        assert_eq!(indexed.len(), 1);
+        assert!(matches!(indexed[0], IndexFilter::Single { .. }));
+        assert_eq!(remaining.len(), 1);
 
         Ok(())
     }
 
     #[test]
-    fn test_analyze_and_optimize_filters_groups_by_index() -> Result<()> {
+    fn test_analyze_and_pushdown() -> Result<()> {
+        let provider = MockTableProvider::new(vec![
+            Arc::new(MockIndex {
+                column_name: "a".into(),
+                table_name: "t".into(),
+            }),
+            Arc::new(MockIndex {
+                column_name: "b".into(),
+                table_name: "t".into(),
+            }),
+        ]);
+        let filters = vec![col("a").eq(lit(1)).and(col("b").eq(lit(2)))];
+        let (indexed, remaining) = provider.analyze_and_optimize_filters(&filters)?;
+
+        assert_eq!(indexed.len(), 1);
+        assert!(matches!(indexed[0], IndexFilter::And { .. }));
+        assert_eq!(remaining.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_or_pushdown() -> Result<()> {
+        let provider = MockTableProvider::new(vec![
+            Arc::new(MockIndex {
+                column_name: "a".into(),
+                table_name: "t".into(),
+            }),
+            Arc::new(MockIndex {
+                column_name: "b".into(),
+                table_name: "t".into(),
+            }),
+        ]);
+        let filters = vec![col("a").eq(lit(1)).or(col("b").eq(lit(2)))];
+        let (indexed, remaining) = provider.analyze_and_optimize_filters(&filters)?;
+
+        assert_eq!(indexed.len(), 1);
+        assert!(matches!(indexed[0], IndexFilter::Or { .. }));
+        assert_eq!(remaining.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_complex_no_pushdown() -> Result<()> {
         let provider = MockTableProvider::new(vec![Arc::new(MockIndex {
             column_name: "a".into(),
             table_name: "t".into(),
         })]);
-        let filters = vec![col("a").eq(lit(1)), col("a").gt(lit(0))];
+        let filters = vec![col("a").eq(lit(1)).and(col("b").eq(lit(2)))];
         let (indexed, remaining) = provider.analyze_and_optimize_filters(&filters)?;
 
-        assert_eq!(indexed.len(), 1, "Expected 1 indexed filter group");
-        assert_eq!(indexed[0].filters.len(), 2, "Expected 2 filters in group");
-        assert_eq!(remaining.len(), 0, "Expected 0 remaining filters");
+        assert_eq!(indexed.len(), 0);
+        assert_eq!(remaining.len(), 1);
 
         Ok(())
     }

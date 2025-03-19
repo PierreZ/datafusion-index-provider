@@ -5,17 +5,17 @@ use std::sync::Arc;
 use datafusion::prelude::Expr;
 
 use crate::physical_plan::Index;
+use std::fmt;
 
-/// Represents an [`Index`] and the filter expressions that it can evaluate.
-///
-/// This is a key data structure used to represent the outcome of filter analysis,
-/// where a set of `Expr`s is associated with a specific index that can handle them.
+/// Represents a filter expression that can be pushed down to an index.
 #[derive(Debug, Clone)]
-pub struct IndexFilter {
-    /// The index that can evaluate the filters.
-    pub index: Arc<dyn Index>,
-    /// The filter expressions to be evaluated by the index.
-    pub filters: Vec<Expr>,
+pub enum IndexFilter {
+    /// Represents one or more filter expressions handled by a single index.
+    Single { index: Arc<dyn Index>, filter: Expr },
+    /// Represents a conjunction (AND) of filters handled by different indexes.
+    And(Vec<IndexFilter>),
+    /// Represents a disjunction (OR) of filters handled by different indexes.
+    Or(Vec<IndexFilter>),
 }
 
 /// A list of [`IndexFilter`]s.
@@ -23,3 +23,19 @@ pub struct IndexFilter {
 /// This represents the collection of all indexes that will be used to satisfy a query,
 /// along with the specific filters each index will be responsible for.
 pub type IndexFilters = Vec<IndexFilter>;
+
+impl fmt::Display for IndexFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IndexFilter::Single { index, .. } => write!(f, "{}", index.name()),
+            IndexFilter::And(filters) => {
+                let parts: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
+                write!(f, "({})", parts.join(" AND "))
+            }
+            IndexFilter::Or(filters) => {
+                let parts: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
+                write!(f, "({})", parts.join(" OR "))
+            }
+        }
+    }
+}
