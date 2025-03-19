@@ -51,14 +51,12 @@ impl DisplayAs for IndexScanExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                let filters: Vec<_> = self.filters.iter().map(|f| f.to_string()).collect();
-                write!(
-                    f,
-                    "IndexScanExec: index={}, filters=[{}], limit={:?}",
-                    self.index.name(),
-                    filters.join(", "),
-                    self.limit
-                )
+                write!(f, "IndexScanExec: index={}, filters=[", self.index.name())?;
+                for (i, filter) in self.filters.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", filter)?;
+                }
+                write!(f, "], limit={:?}", self.limit)
             }
         }
     }

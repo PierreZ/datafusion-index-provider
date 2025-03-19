@@ -47,48 +47,43 @@ pub fn try_create_index_lookup_join(
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    // Assuming both inputs have the row ID column at index 0
-    let left_col = PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0);
-    let right_col = PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0);
+    // Create join columns - both inputs have the row ID column at index 0
+    let join_on = vec![(
+        Arc::new(PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0)) as Arc<dyn PhysicalExpr>,
+        Arc::new(PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0)) as Arc<dyn PhysicalExpr>,
+    )];
 
-    // Wrap columns in Arc<dyn PhysicalExpr> for the join functions
-    let left_col_expr = Arc::new(left_col) as Arc<dyn PhysicalExpr>;
-    let right_col_expr = Arc::new(right_col) as Arc<dyn PhysicalExpr>;
-    let join_on = vec![(left_col_expr, right_col_expr)];
-
-    let left_ordered = left.properties().output_ordering();
-    let right_ordered = right.properties().output_ordering();
-
-    let sort_options = match (left_ordered, right_ordered) {
-        (Some(left), Some(right)) if left.eq(right) => {
-            Some(left.iter().map(|e| e.options).collect())
+    // Check if both inputs are sorted the same way for SortMergeJoin optimization
+    let both_sorted = match (
+        left.properties().output_ordering(),
+        right.properties().output_ordering(),
+    ) {
+        (Some(left_ord), Some(right_ord)) if left_ord.eq(right_ord) => {
+            Some(left_ord.iter().map(|e| e.options).collect())
         }
         _ => None,
     };
 
-    if let Some(sort_options) = sort_options {
-        // Both inputs are sorted on the join key, use SortMergeJoinExec
-        Ok(Arc::new(SortMergeJoinExec::try_new(
-            left.clone(),
-            right.clone(),
-            join_on,         // on: JoinOn
-            None,            // filter: Option<JoinFilter>
-            JoinType::Inner, // Use Inner join for intersection
+    match both_sorted {
+        Some(sort_options) => Ok(Arc::new(SortMergeJoinExec::try_new(
+            left,
+            right,
+            join_on,
+            None,
+            JoinType::Inner,
             sort_options,
             NullEquality::NullEqualsNull,
-        )?))
-    } else {
-        // Use HashJoinExec
-        Ok(Arc::new(HashJoinExec::try_new(
-            left.clone(),
-            right.clone(),
+        )?)),
+        None => Ok(Arc::new(HashJoinExec::try_new(
+            left,
+            right,
             join_on,
-            None, // No filter
+            None,
             &JoinType::Inner,
-            None, // projection: Option<Vec<usize>>
+            None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNull,
-        )?))
+        )?)),
     }
 }
 

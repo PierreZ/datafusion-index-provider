@@ -62,12 +62,24 @@ impl fmt::Display for IndexFilter {
         match self {
             IndexFilter::Single { index, .. } => write!(f, "{}", index.name()),
             IndexFilter::And(filters) => {
-                let parts: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
-                write!(f, "({})", parts.join(" AND "))
+                write!(f, "(")?;
+                for (i, filter) in filters.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " AND ")?;
+                    }
+                    write!(f, "{}", filter)?;
+                }
+                write!(f, ")")
             }
             IndexFilter::Or(filters) => {
-                let parts: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
-                write!(f, "({})", parts.join(" OR "))
+                write!(f, "(")?;
+                for (i, filter) in filters.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " OR ")?;
+                    }
+                    write!(f, "{}", filter)?;
+                }
+                write!(f, ")")
             }
         }
     }

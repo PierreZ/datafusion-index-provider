@@ -35,21 +35,24 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     ///   expressions that can be handled by that index.
     /// - A list of expressions that cannot be handled by any index.
     fn analyze_and_optimize_filters(&self, filters: &[Expr]) -> Result<(IndexFilters, Vec<Expr>)> {
-        let mut indexed_filters = Vec::new();
-        let mut remaining_filters = Vec::new();
+        let (indexed_filters, remaining_filters): (Vec<_>, Vec<_>) = filters
+            .iter()
+            .map(|expr| match self.build_index_filter(expr) {
+                Ok(Some(filter)) => Ok((Some(filter), None)),
+                Ok(None) => Ok((None, Some(expr.clone()))),
+                Err(e) => Err(e),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
 
-        for expr in filters {
-            if let Some(index_filter) = self.build_index_filter(expr)? {
-                indexed_filters.push(index_filter);
-            } else {
-                remaining_filters.push(expr.clone());
-            }
-        }
+        let indexed_filters: Vec<_> = indexed_filters.into_iter().flatten().collect();
+        let remaining_filters: Vec<_> = remaining_filters.into_iter().flatten().collect();
 
-        let final_filters = if indexed_filters.len() > 1 {
-            vec![IndexFilter::And(indexed_filters)]
-        } else {
-            indexed_filters
+        let final_filters = match indexed_filters.len() {
+            0 => Vec::new(),
+            1 => indexed_filters,
+            _ => vec![IndexFilter::And(indexed_filters)],
         };
 
         Ok((final_filters, remaining_filters))
@@ -114,22 +117,17 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         let indexes = self.indexes()?;
-        let mut pushdown = Vec::new();
-        for filter in filters {
-            let mut found_index = false;
-            for index in indexes.iter() {
-                if index.supports_predicate(filter)? {
-                    pushdown.push(TableProviderFilterPushDown::Exact);
-                    found_index = true;
-                    break;
+        filters
+            .iter()
+            .map(|filter| {
+                for index in &indexes {
+                    if index.supports_predicate(filter)? {
+                        return Ok(TableProviderFilterPushDown::Exact);
+                    }
                 }
-            }
-
-            if !found_index {
-                pushdown.push(TableProviderFilterPushDown::Unsupported);
-            }
-        }
-        Ok(pushdown)
+                Ok(TableProviderFilterPushDown::Unsupported)
+            })
+            .collect()
     }
 
     /// Creates an execution plan that scans the table using the provided indexes.
