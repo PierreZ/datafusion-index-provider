@@ -19,6 +19,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_index_provider::optimizer::try_combine_exprs_to_between;
+use datafusion_index_provider::physical::record_fetch::{RecordFetchStream, RecordFetcher};
 use datafusion_index_provider::*;
 use parking_lot::RwLock;
 use std::any::Any;
@@ -547,8 +548,8 @@ impl BatchMapper {
 }
 
 #[async_trait]
-impl MapIndexWithRecord for BatchMapper {
-    async fn map_index_with_record(&mut self, index_batch: RecordBatch) -> Result<RecordBatch> {
+impl RecordFetcher for BatchMapper {
+    async fn fetch_record(&mut self, index_batch: RecordBatch) -> Result<RecordBatch> {
         log::debug!("Index batch: {:?}", index_batch);
         // Get row indices from the index batch
         let indices = index_batch
@@ -635,8 +636,8 @@ impl ExecutionPlan for IndexJoinExec {
         // Create a mapper that will use the index results to filter batches
         let mapper = Box::new(BatchMapper::new(self.batches.clone()));
 
-        // Create and return a ScanWithIndexStream that combines the index results with the actual data
-        Ok(Box::pin(ScanWithIndexStream::new(
+        // Create and return a RecordFetchStream that combines the index results with the actual data
+        Ok(Box::pin(RecordFetchStream::new(
             index_stream,
             partition,
             mapper,
