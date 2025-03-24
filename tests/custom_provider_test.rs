@@ -269,7 +269,7 @@ impl IndexProvider for EmployeeTableProvider {
             match expr {
                 Expr::BinaryExpr(binary) => {
                     if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
-                        if self.supports_index_operator(&col.name, &binary.op) {
+                        if self.supports_operator(&col.name, &binary.op) {
                             column_exprs.entry(col.name.clone()).or_default().push(expr);
                             continue;
                         }
@@ -304,7 +304,7 @@ impl IndexProvider for EmployeeTableProvider {
         match expr {
             Expr::BinaryExpr(binary) => {
                 if let (Expr::Column(col), Expr::Literal(value)) = (&*binary.left, &*binary.right) {
-                    if !self.supports_index_operator(&col.name, &binary.op) {
+                    if !self.supports_operator(&col.name, &binary.op) {
                         return Ok(None);
                     }
 
@@ -524,7 +524,7 @@ impl TableProvider for EmployeeTableProvider {
         for filter in filters {
             if let Expr::BinaryExpr(expr) = *filter {
                 if let (Expr::Column(col), Expr::Literal(_)) = (&*expr.left, &*expr.right) {
-                    if self.supports_index_operator(&col.name, &expr.op) {
+                    if self.supports_operator(&col.name, &expr.op) {
                         pushdown.push(TableProviderFilterPushDown::Exact);
                         continue;
                     }

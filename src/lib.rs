@@ -1,3 +1,14 @@
+//! DataFusion Index Provider implementation.
+//!
+//! This crate provides an extension to DataFusion that adds support for indexed column lookups,
+//! allowing for more efficient query execution when indexes are available.
+//!
+//! The main components are:
+//! * [`IndexProvider`] - A trait that extends TableProvider with index capabilities
+//! * [`IndexedColumn`] - Represents information about an indexed column
+//! * [`physical`] - Module containing physical execution components for index operations
+//! * [`optimizer`] - Module containing query optimization logic for index operations
+
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Operator;
@@ -25,8 +36,8 @@ pub trait IndexProvider: TableProvider {
     /// Returns a map of column names to their index information
     fn get_indexed_columns(&self) -> HashMap<String, IndexedColumn>;
 
-    /// Returns whether a specific column and operator combination is supported by the index
-    fn supports_index_operator(&self, column: &str, op: &Operator) -> bool {
+    /// Returns whether a specific column and operator combination is supported
+    fn supports_operator(&self, column: &str, op: &Operator) -> bool {
         self.get_indexed_columns()
             .get(column)
             .map(|idx| idx.supported_operators.contains(op))

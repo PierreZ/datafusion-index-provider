@@ -1,11 +1,32 @@
+//! Query optimization utilities for index operations.
+//!
+//! This module provides functions to optimize expressions for index lookups,
+//! such as combining multiple range conditions into a single BETWEEN expression.
+
 use datafusion::{
     logical_expr::{Between, Operator},
     prelude::Expr,
 };
 use datafusion_common::{Column, ScalarValue, Spans};
 
-/// Helper function to try combining multiple expressions on a column into a BETWEEN expression
-/// Returns None if the expressions cannot be combined
+/// Helper function to try combining multiple expressions on a column into a BETWEEN expression.
+/// This is useful for optimizing multiple range conditions on the same column into a single
+/// BETWEEN expression that can be handled by an index scan.
+///
+/// # Arguments
+/// * `exprs` - A slice of expressions to try combining
+/// * `column_name` - The name of the column to look for in the expressions
+///
+/// # Returns
+/// * `Some(Vec<Expr>)` - If expressions were successfully combined, returns a new list of expressions
+/// * `None` - If expressions could not be combined (e.g., incompatible operators or values)
+///
+/// # Example
+/// ```ignore
+/// let exprs = vec![col("age").gt(lit(20)), col("age").lt(lit(30))];
+/// let combined = try_combine_exprs_to_between(&exprs, "age");
+/// // Returns a BETWEEN expression: age BETWEEN 21 AND 29
+/// ```
 pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Option<Vec<Expr>> {
     let mut lower_bound = None;
     let mut upper_bound = None;

@@ -9,11 +9,23 @@ use futures_util::{FutureExt, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// A trait for fetching records based on index entries.
+/// Implementors of this trait are responsible for converting index entries into actual data records.
 #[async_trait]
 pub trait RecordFetcher: Send + Sync {
+    /// Fetches actual records based on the provided index batch.
+    ///
+    /// # Arguments
+    /// * `index_batch` - A RecordBatch containing index entries that point to actual records
+    ///
+    /// # Returns
+    /// A RecordBatch containing the fetched records
     async fn fetch_record(&mut self, index_batch: RecordBatch) -> Result<RecordBatch>;
 }
 
+/// A stream that fetches records based on index entries.
+/// This stream takes an input stream of index entries and uses a RecordFetcher
+/// to convert those entries into actual data records.
 pub struct RecordFetchStream {
     /// Input execution plan
     input: Option<SendableRecordBatchStream>,
@@ -26,6 +38,12 @@ pub struct RecordFetchStream {
 }
 
 impl RecordFetchStream {
+    /// Creates a new RecordFetchStream.
+    ///
+    /// # Arguments
+    /// * `input` - The input stream containing index entries
+    /// * `partition` - The partition number for metrics tracking
+    /// * `mapper` - The RecordFetcher implementation that will convert index entries to records
     pub fn new(
         input: SendableRecordBatchStream,
         partition: usize,
@@ -67,6 +85,7 @@ impl Stream for RecordFetchStream {
 }
 
 impl RecordBatchStream for RecordFetchStream {
+    /// Returns the schema of the RecordBatches produced by this stream.
     fn schema(&self) -> SchemaRef {
         self.data_schema.clone()
     }
