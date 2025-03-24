@@ -18,6 +18,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
+use datafusion_index_provider::optimizer::try_combine_exprs_to_between;
 use datafusion_index_provider::*;
 use parking_lot::RwLock;
 use std::any::Any;

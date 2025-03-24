@@ -3,18 +3,19 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
-use datafusion::logical_expr::{Between, Operator};
+use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
-use datafusion::scalar::ScalarValue;
-use datafusion_common::{Column, Result, Spans};
+use datafusion_common::Result;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+pub mod optimizer;
 
 /// Represents information about an indexed column
 #[derive(Debug, Clone)]
@@ -58,91 +59,6 @@ pub trait IndexProvider: TableProvider {
         lookups: Vec<Arc<dyn ExecutionPlan>>,
         projection: Option<&Vec<usize>>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
-}
-
-/// Helper function to try combining multiple expressions on a column into a BETWEEN expression
-/// Returns None if the expressions cannot be combined
-pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Option<Vec<Expr>> {
-    let mut lower_bound = None;
-    let mut upper_bound = None;
-    let mut other_exprs = Vec::new();
-    let mut relation_name = None;
-
-    // First extract the relation name from any of the expressions
-    for expr in exprs {
-        if let Expr::BinaryExpr(binary) = expr {
-            if let (Expr::Column(col), _) = (&*binary.left, &*binary.right) {
-                if col.name == column_name {
-                    relation_name = col.relation.clone();
-                    break;
-                }
-            }
-        }
-    }
-
-    for expr in exprs {
-        if let Expr::BinaryExpr(binary) = expr {
-            if let (Expr::Column(col), Expr::Literal(value)) = (&*binary.left, &*binary.right) {
-                if col.name == column_name {
-                    if let ScalarValue::Int32(Some(val)) = value {
-                        match binary.op {
-                            Operator::GtEq | Operator::Gt => {
-                                // Take the highest lower bound
-                                let val = if binary.op == Operator::Gt {
-                                    val + 1
-                                } else {
-                                    *val
-                                };
-                                match lower_bound {
-                                    None => lower_bound = Some(val),
-                                    Some(current) if val > current => lower_bound = Some(val),
-                                    _ => {}
-                                }
-                            }
-                            Operator::LtEq | Operator::Lt => {
-                                // Take the lowest upper bound
-                                let val = if binary.op == Operator::Lt {
-                                    val - 1
-                                } else {
-                                    *val
-                                };
-                                match upper_bound {
-                                    None => upper_bound = Some(val),
-                                    Some(current) if val < current => upper_bound = Some(val),
-                                    _ => {}
-                                }
-                            }
-                            _ => other_exprs.push((*expr).clone()),
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // If we have both bounds, create the expressions
-    if let (Some(low), Some(high)) = (lower_bound, upper_bound) {
-        let mut optimized = other_exprs;
-
-        // Create BETWEEN low AND high
-        optimized.push(Expr::Between(Between {
-            negated: false,
-            expr: Box::new(Expr::Column(Column {
-                relation: relation_name.clone(),
-                name: column_name.to_string(),
-                spans: Spans::new(),
-            })),
-            // TODO: use the original scalarvalue instead of knowing it is a Int32
-            low: Box::new(Expr::Literal(ScalarValue::Int32(Some(low)))),
-            high: Box::new(Expr::Literal(ScalarValue::Int32(Some(high)))),
-        }));
-
-        log::debug!("Optimized expressions: {:?}", optimized);
-
-        Some(optimized)
-    } else {
-        None
-    }
 }
 
 #[async_trait]
