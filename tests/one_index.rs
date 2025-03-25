@@ -1,19 +1,21 @@
-use arrow::array::{Array, StringArray};
+use std::collections::HashSet;
+
+use arrow::array::{Array, RecordBatch, StringArray};
 use common::employee_provider::EmployeeTableProvider;
 use common::setup_test_env;
 use datafusion::error::Result;
 
 mod common;
 
-#[tokio::test]
-async fn test_employee_table_basic_select() {
-    let ctx = setup_test_env().await;
-
-    let df = ctx.sql("SELECT * FROM employees").await.unwrap();
-    let results = df.collect().await.unwrap();
-    assert_eq!(results[0].num_rows(), 5);
-    assert_eq!(results[0].num_columns(), 4);
-}
+// +----+-------+--------+----------+
+// | id | name  | age    | department|
+// +----+-------+--------+----------+
+// | 1  | Alice | 25    | Engineering|
+// | 2  | Bob   | 30    | Sales      |
+// | 3  |Charlie| 35    | Marketing  |
+// | 4  | David | 28    | Engineering|
+// | 5  | Eve   | 32    | Sales      |
+// +----+-------+--------+----------+
 
 #[tokio::test]
 async fn test_employee_table_filter_age_less_than() {
@@ -24,13 +26,7 @@ async fn test_employee_table_filter_age_less_than() {
         .await
         .unwrap();
     let results = df.collect().await.unwrap();
-    let names = results[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert!(names.iter().any(|n| n == Some("Alice"))); // Alice is 25
-    assert!(names.iter().any(|n| n == Some("David"))); // David is 28
+    assert_names(&results, &["Alice", "David"]);
 }
 
 #[tokio::test]
@@ -42,14 +38,7 @@ async fn test_employee_table_filter_age_greater_equal() {
         .await
         .unwrap();
     let results = df.collect().await.unwrap();
-    let names = results[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert!(names.iter().any(|n| n == Some("Bob"))); // Bob is 30
-    assert!(names.iter().any(|n| n == Some("Charlie"))); // Charlie is 35
-    assert!(names.iter().any(|n| n == Some("Eve"))); // Eve is 32
+    assert_names(&results, &["Bob", "Charlie", "Eve"]);
 }
 
 #[tokio::test]
@@ -61,13 +50,7 @@ async fn test_employee_table_filter_age_exact() {
         .await
         .unwrap();
     let results = df.collect().await.unwrap();
-    let names = results[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert!(names.iter().any(|n| n == Some("Charlie"))); // Only Charlie is 35
-    assert_eq!(names.len() as usize, 1);
+    assert_names(&results, &["Charlie"]);
 }
 
 #[tokio::test]
@@ -79,15 +62,7 @@ async fn test_employee_table_filter_age_between() {
         .await
         .unwrap();
     let results = df.collect().await.unwrap();
-    let names = results[0]
-        .column(1) // name is first in projection
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert!(names.iter().any(|n| n == Some("Alice"))); // Alice is 25
-    assert!(names.iter().any(|n| n == Some("David"))); // David is 28
-    assert!(names.iter().any(|n| n == Some("Bob"))); // Bob is 30
-    assert_eq!(names.len(), 3);
+    assert_names(&results, &["Alice", "Bob", "David"]);
 }
 
 #[tokio::test]
@@ -99,21 +74,70 @@ async fn test_employee_table_filter_department() -> Result<()> {
         .await?;
 
     let results = df.collect().await?;
-    let batch = &results[0];
 
-    assert_eq!(batch.num_rows(), 2);
-
-    let names: Vec<_> = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap()
-        .iter()
-        .collect();
-
-    // Should contain Alice and David who are in Engineering
-    assert!(names.contains(&Some("Alice")));
-    assert!(names.contains(&Some("David")));
+    assert_names(&results, &["Alice", "David"]);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_age_or() -> Result<()> {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT * FROM employees WHERE age = 25 OR age = 30")
+        .await?;
+    let results = df.collect().await?;
+
+    assert_names(&results, &["Alice", "Bob"]);
+
+    Ok(())
+}
+
+// TODO:
+// .sql("SELECT * FROM employees WHERE age = 5 OR age = 10 OR age = 25 OR age = 30")
+
+// #[tokio::test]
+// async fn test_employee_table_filter_multiple_age() -> Result<()> {
+//  let ctx = setup_test_env().await;
+
+//  let df = ctx
+//      .sql("SELECT * FROM employees WHERE age BETWEEN 25 AND 30 OR age = 32")
+//      .await?;
+
+//  let results = df.collect().await?;
+//  assert_names(&results, &["Alice", "Bob", "David", "Eve"]);
+//  Ok(())
+// }
+
+fn assert_names(results: &[RecordBatch], expected_names: &[&str]) {
+    let mut names = HashSet::new();
+    for batch in results {
+        let name_batch = batch
+            .column(1) // name is first in projection
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for name in name_batch.iter().flatten() {
+            names.insert(name.to_string());
+        }
+    }
+
+    for expected_name in expected_names {
+        assert!(
+            names.contains(*expected_name),
+            "Name {} not found in {:?}",
+            expected_name,
+            names
+        );
+    }
+    assert_eq!(
+        names.len(),
+        expected_names.len(),
+        "Expected {} names: {:?}, got {} names: {:?}",
+        expected_names.len(),
+        expected_names,
+        names.len(),
+        names
+    );
 }

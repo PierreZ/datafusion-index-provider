@@ -11,38 +11,22 @@
 
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use datafusion::logical_expr::Operator;
+use datafusion::logical_expr::utils::expr_to_columns;
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 use datafusion_common::Result;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub mod optimizer;
 pub mod physical;
 
-/// Represents information about an indexed column
-#[derive(Debug, Clone)]
-pub struct IndexedColumn {
-    /// Name of the column that is indexed
-    pub name: String,
-    /// List of supported operators for this index
-    pub supported_operators: Vec<Operator>,
-}
-
 /// A provider that supports indexed column lookups
 #[async_trait]
 pub trait IndexProvider: TableProvider {
-    /// Returns a map of column names to their index information
-    fn get_indexed_columns(&self) -> HashMap<String, IndexedColumn>;
-
-    /// Returns whether a specific column and operator combination is supported
-    fn supports_operator(&self, column: &str, op: &Operator) -> bool {
-        self.get_indexed_columns()
-            .get(column)
-            .map(|idx| idx.supported_operators.contains(op))
-            .unwrap_or(false)
-    }
+    /// Returns a set of column names that are indexed
+    fn get_indexed_columns_names(&self) -> HashSet<String>;
 
     /// Optimizes a list of expressions by combining them when possible
     /// For example, multiple expressions on the same column could be combined into a single expression
@@ -53,8 +37,7 @@ pub trait IndexProvider: TableProvider {
     }
 
     /// Creates an IndexLookupExec for the given filter expression
-    /// Returns None if the filter cannot use an index
-    fn create_index_lookup(&self, expr: &Expr) -> Result<Option<Arc<dyn ExecutionPlan>>>;
+    fn create_index_lookup(&self, expr: &Expr) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Creates an execution plan that combines multiple index lookups
     /// Default implementation uses HashJoinExec when multiple indexes are used
@@ -63,4 +46,29 @@ pub trait IndexProvider: TableProvider {
         lookups: Vec<Arc<dyn ExecutionPlan>>,
         projection: Option<&Vec<usize>>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
+
+    /// Overloads the `supports_filters_pushdown` method from `TableProvider` to take advantage of indexes
+    fn supports_index_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        let mut pushdowns = Vec::with_capacity(filters.len());
+        let indexed_columns = self.get_indexed_columns_names();
+        for filter in filters {
+            let mut columns = HashSet::new();
+            expr_to_columns(filter, &mut columns)?;
+
+            for column in columns {
+                let pushdown = if indexed_columns.contains(&column.name) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                };
+                log::debug!("Pushdown: {:?} for column: {}", pushdown, column.name);
+                pushdowns.push(pushdown);
+            }
+        }
+
+        Ok(pushdowns)
+    }
 }

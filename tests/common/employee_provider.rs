@@ -4,25 +4,26 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{Expr, JoinType, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, JoinType, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::Column as PhysicalColumn;
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion::physical_plan::memory::LazyMemoryExec;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 use datafusion_index_provider::optimizer::try_combine_exprs_to_between;
 use datafusion_index_provider::*;
-use parking_lot::RwLock;
 use std::any::Any;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use datafusion::catalog::Session;
 
 use super::exec::{IndexJoinExec, IndexLookupExec};
-use super::indexes::{AgeIndex, DepartmentIndex, NotSoLazyBatchGenerator};
+use super::indexes::{AgeIndex, DepartmentIndex};
 
 /// A simple in-memory table provider that stores employee data with an age index
 #[derive(Debug)]
@@ -35,28 +36,10 @@ pub struct EmployeeTableProvider {
 
 #[async_trait]
 impl IndexProvider for EmployeeTableProvider {
-    fn get_indexed_columns(&self) -> HashMap<String, IndexedColumn> {
-        let mut columns = HashMap::new();
-        columns.insert(
-            "age".to_string(),
-            IndexedColumn {
-                name: "age".to_string(),
-                supported_operators: vec![
-                    Operator::Eq,
-                    Operator::Lt,
-                    Operator::LtEq,
-                    Operator::Gt,
-                    Operator::GtEq,
-                ],
-            },
-        );
-        columns.insert(
-            "department".to_string(),
-            IndexedColumn {
-                name: "department".to_string(),
-                supported_operators: vec![Operator::Eq],
-            },
-        );
+    fn get_indexed_columns_names(&self) -> HashSet<String> {
+        let mut columns = HashSet::new();
+        columns.insert("age".to_string());
+        columns.insert("department".to_string());
         columns
     }
 
@@ -68,7 +51,7 @@ impl IndexProvider for EmployeeTableProvider {
         for expr in exprs {
             if let Expr::BinaryExpr(binary) = expr {
                 if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
-                    if self.supports_operator(&col.name, &binary.op) {
+                    if self.get_indexed_columns_names().contains(&col.name) {
                         column_exprs.entry(col.name.clone()).or_default().push(expr);
                         continue;
                     }
@@ -97,14 +80,24 @@ impl IndexProvider for EmployeeTableProvider {
         Ok(optimized)
     }
 
-    fn create_index_lookup(&self, expr: &Expr) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    fn create_index_lookup(&self, expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
+        log::debug!("Creating index lookup for expression: {:?}", expr);
         match expr {
-            Expr::BinaryExpr(binary) => {
-                if let (Expr::Column(col), Expr::Literal(value)) = (&*binary.left, &*binary.right) {
-                    if !self.supports_operator(&col.name, &binary.op) {
-                        return Ok(None);
-                    }
+            Expr::BinaryExpr(binary) => match (binary.left.as_ref(), binary.right.as_ref()) {
+                (Expr::BinaryExpr(left), Expr::BinaryExpr(right)) => {
+                    let left_expr = Expr::BinaryExpr(left.clone());
+                    let right_expr = Expr::BinaryExpr(right.clone());
 
+                    let left_exec = self.create_index_lookup(&left_expr)?;
+                    let right_exec = self.create_index_lookup(&right_expr)?;
+
+                    log::debug!("Left exec: {:?}", left_exec);
+                    log::debug!("Right exec: {:?}", right_exec);
+                    log::debug!("Binary operator: {:?}", binary.op);
+
+                    Ok(Arc::new(UnionExec::new(vec![left_exec, right_exec])))
+                }
+                (Expr::Column(col), Expr::Literal(value)) => {
                     let filtered_indices = match (col.name.as_str(), value) {
                         ("age", ScalarValue::Int32(Some(age))) => {
                             self.age_index.filter_rows(&binary.op, *age)
@@ -112,7 +105,7 @@ impl IndexProvider for EmployeeTableProvider {
                         ("department", ScalarValue::Utf8(Some(dept))) => {
                             self.department_index.filter_rows(&binary.op, dept)
                         }
-                        _ => return Ok(None),
+                        _ => return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty())))),
                     };
 
                     let index_schema = Arc::new(Schema::new(vec![Field::new(
@@ -121,14 +114,16 @@ impl IndexProvider for EmployeeTableProvider {
                         false,
                     )]));
 
-                    Ok(Some(Arc::new(IndexLookupExec::new(
+                    Ok(Arc::new(IndexLookupExec::new(
                         index_schema,
                         filtered_indices,
-                    ))))
-                } else {
-                    Ok(None)
+                    )))
                 }
-            }
+                _ => Err(DataFusionError::Internal(format!(
+                    "Unsupported expression: {:?}",
+                    expr
+                ))),
+            },
             Expr::Between(between) => {
                 if let Expr::Column(col) = between.expr.as_ref() {
                     if let (
@@ -146,16 +141,16 @@ impl IndexProvider for EmployeeTableProvider {
                                 false,
                             )]));
 
-                            return Ok(Some(Arc::new(IndexLookupExec::new(
+                            return Ok(Arc::new(IndexLookupExec::new(
                                 index_schema,
                                 filtered_indices,
-                            ))));
+                            )));
                         }
                     }
                 }
-                Ok(None)
+                Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))))
             }
-            _ => Ok(None),
+            _ => Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty())))),
         }
     }
 
@@ -165,14 +160,7 @@ impl IndexProvider for EmployeeTableProvider {
         projection: Option<&Vec<usize>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match lookups.len() {
-            0 => {
-                let data = self.batches.clone();
-                let schema = self.schema.clone();
-
-                let generator = Arc::new(RwLock::new(NotSoLazyBatchGenerator { data }));
-
-                Ok(Arc::new(LazyMemoryExec::try_new(schema, vec![generator])?))
-            }
+            0 => Err(DataFusionError::Internal("No lookups provided".to_string())),
             1 => {
                 // Single index - use IndexJoinExec
                 Ok(Arc::new(IndexJoinExec::new(
@@ -295,6 +283,7 @@ impl TableProvider for EmployeeTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        log::debug!("Passed {} filters. Filters: {:?}", filters.len(), filters);
         // First optimize the expressions
         let optimized_filters = self.optimize_exprs(filters)?;
 
@@ -303,9 +292,8 @@ impl TableProvider for EmployeeTableProvider {
         // Create index lookups for each optimized filter
         let mut lookups = Vec::new();
         for filter in optimized_filters {
-            if let Some(lookup) = self.create_index_lookup(&filter)? {
-                lookups.push(lookup);
-            }
+            let lookup = self.create_index_lookup(&filter)?;
+            lookups.push(lookup);
         }
 
         // Create the appropriate join plan based on number of lookups
@@ -316,19 +304,6 @@ impl TableProvider for EmployeeTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        log::debug!("Checking filters: {:?}", filters);
-        let mut pushdown = Vec::with_capacity(filters.len());
-        for filter in filters {
-            if let Expr::BinaryExpr(expr) = *filter {
-                if let (Expr::Column(col), Expr::Literal(_)) = (&*expr.left, &*expr.right) {
-                    if self.supports_operator(&col.name, &expr.op) {
-                        pushdown.push(TableProviderFilterPushDown::Exact);
-                        continue;
-                    }
-                }
-            }
-            pushdown.push(TableProviderFilterPushDown::Unsupported);
-        }
-        Ok(pushdown)
+        self.supports_index_filters_pushdown(filters)
     }
 }
