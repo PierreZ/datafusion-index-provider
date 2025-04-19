@@ -1,26 +1,20 @@
+use std::collections::{HashMap, HashSet};
+use std::{any::Any, sync::Arc};
+
 use arrow::array::{Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{Expr, JoinType, TableProviderFilterPushDown};
-use datafusion::physical_expr::expressions::Column as PhysicalColumn;
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
+
+use datafusion::physical_plan::{empty::EmptyExec, union::UnionExec, ExecutionPlan};
 use datafusion::scalar::ScalarValue;
 use datafusion_index_provider::optimizer::try_combine_exprs_to_between;
+use datafusion_index_provider::physical::joins::try_create_lookup_join;
 use datafusion_index_provider::*;
-use std::any::Any;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::fmt::Debug;
-use std::sync::Arc;
-
-use datafusion::catalog::Session;
 
 use super::exec::{IndexJoinExec, IndexLookupExec};
 use super::indexes::{AgeIndex, DepartmentIndex};
@@ -84,19 +78,6 @@ impl IndexProvider for EmployeeTableProvider {
         log::debug!("Creating index lookup for expression: {:?}", expr);
         match expr {
             Expr::BinaryExpr(binary) => match (binary.left.as_ref(), binary.right.as_ref()) {
-                (Expr::BinaryExpr(left), Expr::BinaryExpr(right)) => {
-                    let left_expr = Expr::BinaryExpr(left.clone());
-                    let right_expr = Expr::BinaryExpr(right.clone());
-
-                    let left_exec = self.create_index_lookup(&left_expr)?;
-                    let right_exec = self.create_index_lookup(&right_expr)?;
-
-                    log::debug!("Left exec: {:?}", left_exec);
-                    log::debug!("Right exec: {:?}", right_exec);
-                    log::debug!("Binary operator: {:?}", binary.op);
-
-                    Ok(Arc::new(UnionExec::new(vec![left_exec, right_exec])))
-                }
                 (Expr::Column(col), Expr::Literal(value)) => {
                     let filtered_indices = match (col.name.as_str(), value) {
                         ("age", ScalarValue::Int32(Some(age))) => {
@@ -119,9 +100,19 @@ impl IndexProvider for EmployeeTableProvider {
                         filtered_indices,
                     )))
                 }
+                (Expr::BinaryExpr(left), Expr::BinaryExpr(right)) if binary.op == Operator::Or => {
+                    let left_expr = Expr::BinaryExpr(left.clone());
+                    let right_expr = Expr::BinaryExpr(right.clone());
+
+                    let left_exec = self.create_index_lookup(&left_expr)?;
+                    let right_exec = self.create_index_lookup(&right_expr)?;
+
+                    log::debug!("Combining OR expression with UnionExec");
+                    Ok(Arc::new(UnionExec::new(vec![left_exec, right_exec])))
+                }
                 _ => Err(DataFusionError::Internal(format!(
-                    "Unsupported expression: {:?}",
-                    expr
+                    "Unsupported expression structure within BinaryExpr: {:?}",
+                    binary
                 ))),
             },
             Expr::Between(between) => {
@@ -162,7 +153,7 @@ impl IndexProvider for EmployeeTableProvider {
         match lookups.len() {
             0 => Err(DataFusionError::Internal("No lookups provided".to_string())),
             1 => {
-                // Single index - use IndexJoinExec
+                // Handle single column case
                 Ok(Arc::new(IndexJoinExec::new(
                     lookups[0].clone(),
                     self.batches.clone(),
@@ -171,26 +162,11 @@ impl IndexProvider for EmployeeTableProvider {
                 )))
             }
             2 => {
-                // Handle multiple columns case with HashJoin
+                // Handle two columns case with HashJoin or SortMergeJoin
                 let left = lookups[0].clone();
                 let right = lookups[1].clone();
 
-                // Join on the index column which is present in both index results
-                let left_col = Arc::new(PhysicalColumn::new("index", 0)) as Arc<dyn PhysicalExpr>;
-                let right_col = Arc::new(PhysicalColumn::new("index", 0)) as Arc<dyn PhysicalExpr>;
-                let join_on = vec![(left_col, right_col)];
-
-                // Create HashJoinExec to join the index results
-                let join_exec = Arc::new(HashJoinExec::try_new(
-                    left,
-                    right,
-                    join_on,
-                    None,
-                    &JoinType::Inner,
-                    None, // No filter columns
-                    PartitionMode::CollectLeft,
-                    false,
-                )?);
+                let join_exec = try_create_lookup_join(left, right)?;
 
                 // Join with the actual data using IndexJoinExec
                 Ok(Arc::new(IndexJoinExec::new(

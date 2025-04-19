@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -17,11 +17,42 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use datafusion_common::arrow::compute::SortOptions;
+
 pub fn compute_properties(schema: SchemaRef) -> PlanProperties {
-    let eq_properties = EquivalenceProperties::new(schema);
+    let eq_properties = EquivalenceProperties::new(schema.clone());
     PlanProperties::new(
         eq_properties,
         Partitioning::UnknownPartitioning(1),
+        EmissionType::Incremental,
+        Boundedness::Bounded,
+    )
+}
+
+/// Compute properties for a plan that produces output sorted by the 'index' column.
+#[allow(dead_code)]
+pub fn compute_sorted_properties(schema: SchemaRef) -> PlanProperties {
+    // Define the sorting expression for the 'index' column (UInt64, index 0)
+    let sort_expr = PhysicalSortExpr {
+        expr: Arc::new(datafusion::physical_expr::expressions::Column::new(
+            "index", 0,
+        )) as Arc<dyn PhysicalExpr>,
+        options: SortOptions {
+            descending: false,  // Ascending
+            nulls_first: false, // Doesn't matter for non-nullable index column
+        },
+    };
+    let ordering = vec![sort_expr];
+
+    // Create EquivalenceProperties using the new_with_orderings constructor
+    let eq_properties =
+        EquivalenceProperties::new_with_orderings(schema.clone(), &[ordering.into()]);
+
+    // Create PlanProperties using the new constructor
+    // Output ordering will be derived from eq_properties
+    PlanProperties::new(
+        eq_properties,
+        Partitioning::UnknownPartitioning(1), // Assuming single partition for now
         EmissionType::Incremental,
         Boundedness::Bounded,
     )
@@ -40,7 +71,18 @@ impl IndexLookupExec {
         IndexLookupExec {
             schema: schema.clone(),
             filtered_indices,
+            // Default to basic properties (no sorting assumed)
             cache: compute_properties(schema),
+        }
+    }
+
+    /// Create a new IndexLookupExec assuming its output *is* sorted by index.
+    pub fn new_sorted(schema: SchemaRef, filtered_indices: Vec<usize>) -> Self {
+        IndexLookupExec {
+            schema: schema.clone(),
+            filtered_indices,
+            // Use the properties indicating sorted output
+            cache: compute_sorted_properties(schema),
         }
     }
 }
@@ -181,6 +223,10 @@ impl ExecutionPlan for IndexJoinExec {
         self.schema.clone()
     }
 
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.index_exec]
     }
@@ -226,10 +272,6 @@ impl ExecutionPlan for IndexJoinExec {
 
     fn name(&self) -> &str {
         "IndexJoinExec"
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.cache
     }
 }
 

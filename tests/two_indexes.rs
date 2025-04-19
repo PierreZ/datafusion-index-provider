@@ -1,13 +1,16 @@
 use arrow::array::{Array, Int32Array, StringArray};
 use common::employee_provider::EmployeeTableProvider;
-use common::setup_test_env;
 use datafusion::error::Result;
+use datafusion::prelude::SessionContext;
+use std::sync::Arc;
 
 mod common;
 
 #[tokio::test]
 async fn test_employee_table_filter_age_and_department() -> Result<()> {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT name, age, department FROM employees WHERE age = 25 AND department = 'Engineering'")
@@ -53,7 +56,9 @@ async fn test_employee_table_filter_age_and_department() -> Result<()> {
 
 #[tokio::test]
 async fn test_employee_table_filter_age_greater_than_20_and_department() -> Result<()> {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT name, age, department FROM employees WHERE age > 20 AND department = 'Engineering'")
@@ -100,7 +105,9 @@ async fn test_employee_table_filter_age_greater_than_20_and_department() -> Resu
 
 #[tokio::test]
 async fn test_employee_table_filter_no_matches() -> Result<()> {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT name, age, department FROM employees WHERE age > 40 AND department = 'Engineering'")

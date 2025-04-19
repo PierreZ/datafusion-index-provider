@@ -1,9 +1,10 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch, StringArray};
 use common::employee_provider::EmployeeTableProvider;
-use common::setup_test_env;
 use datafusion::error::Result;
+use datafusion::prelude::SessionContext;
 
 mod common;
 
@@ -19,7 +20,9 @@ mod common;
 
 #[tokio::test]
 async fn test_employee_table_filter_age_less_than() {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT name, age FROM employees WHERE age < 30")
@@ -31,7 +34,9 @@ async fn test_employee_table_filter_age_less_than() {
 
 #[tokio::test]
 async fn test_employee_table_filter_age_greater_equal() {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT name, age FROM employees WHERE age >= 30")
@@ -43,7 +48,9 @@ async fn test_employee_table_filter_age_greater_equal() {
 
 #[tokio::test]
 async fn test_employee_table_filter_age_exact() {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT name, age FROM employees WHERE age = 35")
@@ -55,7 +62,9 @@ async fn test_employee_table_filter_age_exact() {
 
 #[tokio::test]
 async fn test_employee_table_filter_age_between() {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT name, age FROM employees WHERE age BETWEEN 25 AND 30")
@@ -67,7 +76,9 @@ async fn test_employee_table_filter_age_between() {
 
 #[tokio::test]
 async fn test_employee_table_filter_department() -> Result<()> {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT * FROM employees WHERE department = 'Engineering'")
@@ -82,7 +93,9 @@ async fn test_employee_table_filter_department() -> Result<()> {
 
 #[tokio::test]
 async fn test_employee_table_filter_age_or() -> Result<()> {
-    let ctx = setup_test_env().await;
+    let ctx = SessionContext::new();
+    let provider = EmployeeTableProvider::new();
+    ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     let df = ctx
         .sql("SELECT * FROM employees WHERE age = 25 OR age = 30")

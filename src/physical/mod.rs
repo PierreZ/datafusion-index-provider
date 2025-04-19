@@ -6,4 +6,5 @@
 //! * Record fetching - Converting index entries to actual records
 //! * Stream processing - Handling record batches in a streaming fashion
 
+pub mod joins;
 pub mod record_fetch;
