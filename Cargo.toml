@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1.77"
-datafusion = "46.0.0"
-datafusion-common = "46.0.0"
-arrow = "54.2.1"
+datafusion = "46.0.1"
+datafusion-common = "46.0.1"
+arrow = "54.3.1"
 futures = "0.3.26"
 futures-util = "0.3.30"
 futures-core = "0.3.30"
