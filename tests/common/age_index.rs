@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, RecordBatch, UInt64Array};
@@ -72,6 +73,52 @@ impl AgeIndex {
             .copied()
             .collect()
     }
+
+    // Helper to get matching row IDs based on operator and value
+    fn get_matching_ids(&self, op: Operator, val: i32) -> Result<HashSet<u64>> {
+        let mut matching_ids = HashSet::new();
+
+        match op {
+            Operator::Eq => {
+                if let Some(ids) = self.index.get(&val) {
+                    matching_ids.extend(ids.iter().copied());
+                }
+            }
+            Operator::NotEq => {
+                // Combine IDs from values less than val and greater than val
+                let range1 = self.index.range((Unbounded, Excluded(&val)));
+                let range2 = self.index.range((Excluded(&val), Unbounded));
+                for (_, ids) in range1.chain(range2) {
+                    matching_ids.extend(ids.iter().copied());
+                }
+            }
+            Operator::Lt => {
+                for (_, ids) in self.index.range((Unbounded, Excluded(&val))) {
+                    matching_ids.extend(ids.iter().copied());
+                }
+            }
+            Operator::LtEq => {
+                for (_, ids) in self.index.range((Unbounded, Included(&val))) {
+                    matching_ids.extend(ids.iter().copied());
+                }
+            }
+            Operator::Gt => {
+                for (_, ids) in self.index.range((Excluded(&val), Unbounded)) {
+                    matching_ids.extend(ids.iter().copied());
+                }
+            }
+            Operator::GtEq => {
+                for (_, ids) in self.index.range((Included(&val), Unbounded)) {
+                    matching_ids.extend(ids.iter().copied());
+                }
+            }
+            _ => {
+                log::warn!("Unsupported operator in AgeIndex scan: {:?}", op);
+                // Return empty set for unsupported ops
+            }
+        }
+        Ok(matching_ids)
+    }
 }
 
 impl Index for AgeIndex {
@@ -100,6 +147,7 @@ impl Index for AgeIndex {
         Ok(cols.iter().any(|col| col.name == "age"))
     }
 
+    // Simplified scan using helper method
     fn scan(
         &self,
         predicate: &Expr,
@@ -108,83 +156,55 @@ impl Index for AgeIndex {
         log::debug!("Scanning AgeIndex with predicate: {:?}", predicate);
         let schema = self.index_schema();
 
-        let mut matching_ids = HashSet::new();
+        let mut matching_ids = HashSet::new(); // Default empty
 
+        // --- Predicate Parsing ---
         if let Expr::BinaryExpr(be) = predicate {
+            // Check if it's Column("age") Op Literal(Int32)
             if let Expr::Column(col) = be.left.as_ref() {
                 if col.name == "age" {
                     if let Expr::Literal(lit) = be.right.as_ref() {
                         if let ScalarValue::Int32(Some(val)) = lit {
-                            match be.op {
-                                Operator::Eq => {
-                                    if let Some(ids) = self.index.get(val) {
-                                        matching_ids.extend(ids.iter().copied());
-                                    }
-                                }
-                                Operator::NotEq => {
-                                    for (age, ids) in self.index.iter() {
-                                        if age != val {
-                                            matching_ids.extend(ids.iter().copied());
-                                        }
-                                    }
-                                }
-                                Operator::Lt => {
-                                    for (age, ids) in self.index.iter() {
-                                        if age < val {
-                                            matching_ids.extend(ids.iter().copied());
-                                        }
-                                    }
-                                }
-                                Operator::LtEq => {
-                                    for (age, ids) in self.index.iter() {
-                                        if age <= val {
-                                            matching_ids.extend(ids.iter().copied());
-                                        }
-                                    }
-                                }
-                                Operator::Gt => {
-                                    for (age, ids) in self.index.iter() {
-                                        if age > val {
-                                            matching_ids.extend(ids.iter().copied());
-                                        }
-                                    }
-                                }
-                                Operator::GtEq => {
-                                    for (age, ids) in self.index.iter() {
-                                        if age >= val {
-                                            matching_ids.extend(ids.iter().copied());
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    log::warn!(
-                                        "Unsupported operator in AgeIndex scan: {:?}",
-                                        be.op
-                                    );
-                                    return Ok(Box::pin(MemoryStream::try_new(
-                                        vec![],
-                                        schema,
-                                        None,
-                                    )?));
-                                }
-                            }
+                            // Use the helper function to get IDs
+                            matching_ids = self.get_matching_ids(be.op, *val)?;
                         } else {
-                            log::warn!("AgeIndex scan predicate has non-Int32 literal: {:?}", lit);
-                            return Ok(Box::pin(MemoryStream::try_new(vec![], schema, None)?));
+                            log::warn!(
+                                "AgeIndex scan predicate has non-Int32 literal: {:?}",
+                                lit
+                            );
                         }
-                    }
+                    } // Could potentially handle Column on right side later
                 }
-            }
+            // TODO: Handle case where left is Literal and right is Column("age")?
+            } // Only handle Column on left for now
+        } else {
+            // Log if predicate is not a simple binary expression we handle
+            log::warn!(
+                "AgeIndex scan predicate is not a supported BinaryExpr: {:?}",
+                predicate
+            );
+            // Could potentially try to evaluate more complex expressions or return all ids,
+            // but for now, we return empty results if the predicate isn't simple.
         }
+        // --- End Predicate Parsing ---
 
-        let row_ids: Vec<u64> = matching_ids.into_iter().collect();
-        if row_ids.is_empty() {
+
+        // --- Construct RecordBatch Stream ---
+        if matching_ids.is_empty() {
+            // Return empty stream if no matches or predicate not supported
             return Ok(Box::pin(MemoryStream::try_new(vec![], schema, None)?));
         }
+
+        // Convert HashSet<u64> to UInt64Array
+        let row_ids: Vec<u64> = matching_ids.into_iter().collect();
         let id_array = Arc::new(UInt64Array::from(row_ids));
+
+        // Create RecordBatch with the row IDs
         let batch = RecordBatch::try_new(schema.clone(), vec![id_array])?;
 
+        // Return stream with the single batch
         Ok(Box::pin(MemoryStream::try_new(vec![batch], schema, None)?))
+        // --- End Construct RecordBatch Stream ---
     }
 
     fn statistics(&self) -> Statistics {
