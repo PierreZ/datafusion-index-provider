@@ -9,32 +9,39 @@ use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-
-use datafusion::physical_plan::{empty::EmptyExec, union::UnionExec, ExecutionPlan};
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan};
 use datafusion::scalar::ScalarValue;
 use datafusion_index_provider::optimizer::try_combine_exprs_to_between;
+use datafusion_index_provider::physical::indexes::index::Index;
 use datafusion_index_provider::physical::joins::try_create_lookup_join;
-use datafusion_index_provider::*;
+use datafusion_index_provider::provider::IndexedTableProvider;
 
 use super::exec::{IndexJoinExec, IndexLookupExec};
-use super::indexes::{AgeIndex, DepartmentIndex};
+use super::age_index::AgeIndex;
+use super::department_index::DepartmentIndex;
 
 /// A simple in-memory table provider that stores employee data with an age index
 #[derive(Debug)]
 pub struct EmployeeTableProvider {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
-    age_index: AgeIndex,
-    department_index: DepartmentIndex,
+    age_index: Arc<AgeIndex>,
+    department_index: Arc<DepartmentIndex>,
+    indexes: Vec<Arc<dyn Index>>,
 }
 
 #[async_trait]
-impl IndexProvider for EmployeeTableProvider {
-    fn get_indexed_columns_names(&self) -> HashSet<String> {
+impl IndexedTableProvider for EmployeeTableProvider {
+    fn indexes(&self) -> Result<Vec<Arc<dyn Index>>> {
+        Ok(self.indexes.clone())
+    }
+
+    fn get_indexed_columns_names(&self) -> Result<HashSet<String>> {
         let mut columns = HashSet::new();
         columns.insert("age".to_string());
         columns.insert("department".to_string());
-        columns
+        Ok(columns)
     }
 
     fn optimize_exprs(&self, exprs: &[Expr]) -> Result<Vec<Expr>> {
@@ -45,7 +52,11 @@ impl IndexProvider for EmployeeTableProvider {
         for expr in exprs {
             if let Expr::BinaryExpr(binary) = expr {
                 if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
-                    if self.get_indexed_columns_names().contains(&col.name) {
+                    if self
+                        .get_indexed_columns_names()
+                        .unwrap()
+                        .contains(&col.name)
+                    {
                         column_exprs.entry(col.name.clone()).or_default().push(expr);
                         continue;
                     }
@@ -98,6 +109,7 @@ impl IndexProvider for EmployeeTableProvider {
                     Ok(Arc::new(IndexLookupExec::new(
                         index_schema,
                         filtered_indices,
+                        false, // Not sorted
                     )))
                 }
                 (Expr::BinaryExpr(left), Expr::BinaryExpr(right)) if binary.op == Operator::Or => {
@@ -135,6 +147,7 @@ impl IndexProvider for EmployeeTableProvider {
                             return Ok(Arc::new(IndexLookupExec::new(
                                 index_schema,
                                 filtered_indices,
+                                false, // Not sorted
                             )));
                         }
                     }
@@ -181,6 +194,8 @@ impl IndexProvider for EmployeeTableProvider {
             )),
         }
     }
+
+    // `find_suitable_indexes` uses the default implementation provided by the trait for now.
 }
 
 impl Default for EmployeeTableProvider {
@@ -191,7 +206,7 @@ impl Default for EmployeeTableProvider {
 
 impl EmployeeTableProvider {
     pub fn new() -> Self {
-        // Define schema: id, name, department, age
+        // Define schema: id, name, age, department
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
@@ -212,10 +227,10 @@ impl EmployeeTableProvider {
         ]);
 
         // Create the age index
-        let age_index = AgeIndex::new(&age_array);
+        let age_index = Arc::new(AgeIndex::new(&age_array));
 
         // Create the department index
-        let department_index = DepartmentIndex::new(&department_array);
+        let department_index = Arc::new(DepartmentIndex::new(&department_array));
 
         // Create record batch
         let batch = RecordBatch::try_new(
@@ -232,8 +247,9 @@ impl EmployeeTableProvider {
         EmployeeTableProvider {
             schema,
             batches: vec![batch],
-            age_index,
-            department_index,
+            age_index: age_index.clone(),
+            department_index: department_index.clone(),
+            indexes: vec![age_index, department_index],
         }
     }
 }
@@ -269,7 +285,7 @@ impl TableProvider for EmployeeTableProvider {
         // Step 1: Analyze Filters and Optimize
         let mut index_filters = Vec::new();
         let mut remaining_filters = Vec::new();
-        let indexed_columns = self.get_indexed_columns_names();
+        let indexed_columns = self.get_indexed_columns_names().unwrap();
 
         for filter in filters {
             let mut pushed_down = false;
@@ -346,6 +362,20 @@ impl TableProvider for EmployeeTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        self.supports_index_filters_pushdown(filters)
+        let indexed_columns = self.get_indexed_columns_names().unwrap();
+        let results = filters
+            .iter()
+            .map(|filter| {
+                let cols = filter.column_refs();
+                if cols.iter().any(|col| indexed_columns.contains(&col.name)) {
+                    // If any part of the filter uses an indexed column, push down exactly
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    // Otherwise, the provider cannot handle it
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(results)
     }
 }

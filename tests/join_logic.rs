@@ -26,12 +26,13 @@ fn test_uses_sort_merge_join() {
     let dummy_indices = vec![1, 3, 5];
 
     // Create two IndexLookupExec plans that *report* sorted output
-    let left_sorted = Arc::new(IndexLookupExec::new_sorted(
+    let left_sorted = Arc::new(IndexLookupExec::new(
         schema.clone(),
         dummy_indices.clone(),
+        true,
     )) as Arc<dyn ExecutionPlan>;
     let right_sorted =
-        Arc::new(IndexLookupExec::new_sorted(schema, dummy_indices)) as Arc<dyn ExecutionPlan>;
+        Arc::new(IndexLookupExec::new(schema, dummy_indices, true)) as Arc<dyn ExecutionPlan>;
 
     // Call the join logic function
     let result_plan = try_create_lookup_join(left_sorted, right_sorted).unwrap();
@@ -49,10 +50,13 @@ fn test_uses_hash_join() {
     let dummy_indices = vec![5, 1, 3]; // Unsorted indices
 
     // Create two standard IndexLookupExec plans (which report unsorted output)
-    let left_unsorted = Arc::new(IndexLookupExec::new(schema.clone(), dummy_indices.clone()))
-        as Arc<dyn ExecutionPlan>;
+    let left_unsorted = Arc::new(IndexLookupExec::new(
+        schema.clone(),
+        dummy_indices.clone(),
+        false,
+    )) as Arc<dyn ExecutionPlan>;
     let right_unsorted =
-        Arc::new(IndexLookupExec::new(schema, dummy_indices)) as Arc<dyn ExecutionPlan>;
+        Arc::new(IndexLookupExec::new(schema, dummy_indices, false)) as Arc<dyn ExecutionPlan>;
 
     // Call the join logic function
     let result_plan = try_create_lookup_join(left_unsorted, right_unsorted).unwrap();

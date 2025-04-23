@@ -1,11 +1,10 @@
-use arrow::array::{Array, Int32Array, UInt64Array};
+use arrow::array::{Array, UInt64Array};
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use datafusion::error::Result;
+use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
@@ -15,7 +14,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_common::DataFusionError;
 use futures::{stream::StreamExt, TryFutureExt};
 use std::any::Any;
 use std::collections::HashSet;
@@ -33,7 +31,6 @@ pub fn compute_properties(schema: SchemaRef) -> PlanProperties {
 }
 
 /// Compute properties for a plan that produces output sorted by the 'index' column.
-#[allow(dead_code)]
 pub fn compute_sorted_properties(schema: SchemaRef) -> PlanProperties {
     // Define the sorting expression for the 'index' column (UInt64, index 0)
     let sort_expr = PhysicalSortExpr {
@@ -70,22 +67,16 @@ pub struct IndexLookupExec {
 }
 
 impl IndexLookupExec {
-    pub fn new(schema: SchemaRef, filtered_indices: Vec<u64>) -> Self {
+    pub fn new(schema: SchemaRef, filtered_indices: Vec<u64>, sorted: bool) -> Self {
+        let cache = if sorted {
+            compute_sorted_properties(schema.clone())
+        } else {
+            compute_properties(schema.clone())
+        };
         IndexLookupExec {
             schema: schema.clone(),
             filtered_indices,
-            // Default to basic properties (no sorting assumed)
-            cache: compute_properties(schema),
-        }
-    }
-
-    /// Create a new IndexLookupExec assuming its output *is* sorted by index.
-    pub fn new_sorted(schema: SchemaRef, filtered_indices: Vec<u64>) -> Self {
-        IndexLookupExec {
-            schema: schema.clone(),
-            filtered_indices,
-            // Use the properties indicating sorted output
-            cache: compute_sorted_properties(schema),
+            cache,
         }
     }
 }
@@ -314,21 +305,4 @@ impl ExecutionPlan for IndexJoinExec {
     fn name(&self) -> &str {
         "IndexJoinExec"
     }
-}
-
-fn apply_row_filter(batch: &RecordBatch, row_ids: &[usize]) -> Result<RecordBatch> {
-    log::debug!("Row ids: {:?}", row_ids);
-    let new_columns: Result<Vec<Arc<dyn Array>>> = batch
-        .columns()
-        .iter()
-        .map(|col| {
-            Ok(Arc::new(arrow::compute::take(
-                col.as_ref(),
-                &Int32Array::from_iter_values(row_ids.iter().map(|&i| i as i32)),
-                None,
-            )?) as Arc<dyn Array>)
-        })
-        .collect();
-
-    Ok(RecordBatch::try_new(batch.schema(), new_columns?)?)
 }
