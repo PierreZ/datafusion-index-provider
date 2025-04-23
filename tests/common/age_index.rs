@@ -160,23 +160,45 @@ impl Index for AgeIndex {
 
         // --- Predicate Parsing ---
         if let Expr::BinaryExpr(be) = predicate {
-            // Check if it's Column("age") Op Literal(Int32)
-            if let Expr::Column(col) = be.left.as_ref() {
-                if col.name == "age" {
-                    if let Expr::Literal(lit) = be.right.as_ref() {
-                        if let ScalarValue::Int32(Some(val)) = lit {
-                            // Use the helper function to get IDs
-                            matching_ids = self.get_matching_ids(be.op, *val)?;
-                        } else {
-                            log::warn!(
-                                "AgeIndex scan predicate has non-Int32 literal: {:?}",
-                                lit
-                            );
-                        }
-                    } // Could potentially handle Column on right side later
+            let (col_expr, op, lit_expr) = match (be.left.as_ref(), be.op, be.right.as_ref()) {
+                // Case 1: Column Op Literal
+                (Expr::Column(col), op, Expr::Literal(lit)) if col.name == "age" => (col, op, lit),
+                // Case 2: Literal Op Column
+                (Expr::Literal(lit), op, Expr::Column(col)) if col.name == "age" => {
+                    // Swap operator for column comparison
+                    (col, op.swap().unwrap_or(op), lit)
                 }
-            // TODO: Handle case where left is Literal and right is Column("age")?
-            } // Only handle Column on left for now
+                // Other cases not supported for this index
+                _ => {
+                    log::warn!(
+                        "AgeIndex scan predicate structure not supported: {:?}",
+                        predicate
+                    );
+                    (
+                        // Return dummy values to avoid further processing
+                        &datafusion_common::Column {
+                            relation: None,
+                            name: "".to_string(),
+                            spans: Default::default(), // Fix: Add missing spans field
+                        }, // Dummy column
+                        Operator::Eq,              // Dummy Op
+                        &ScalarValue::Int32(None), // Dummy Literal
+                    )
+                }
+            };
+
+            // Proceed only if the column name was 'age' (avoid processing dummy values)
+            if col_expr.name == "age" {
+                if let ScalarValue::Int32(Some(val)) = lit_expr {
+                    // Use the helper function to get IDs with potentially swapped operator
+                    matching_ids = self.get_matching_ids(op, *val)?;
+                } else {
+                    log::warn!(
+                        "AgeIndex scan predicate has non-Int32 literal: {:?}",
+                        lit_expr
+                    );
+                }
+            }
         } else {
             // Log if predicate is not a simple binary expression we handle
             log::warn!(
@@ -187,7 +209,6 @@ impl Index for AgeIndex {
             // but for now, we return empty results if the predicate isn't simple.
         }
         // --- End Predicate Parsing ---
-
 
         // --- Construct RecordBatch Stream ---
         if matching_ids.is_empty() {

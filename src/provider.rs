@@ -2,8 +2,10 @@ use crate::physical::indexes::index::Index;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::error::Result;
-use datafusion::logical_expr::{utils::expr_to_columns, Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::utils::expr_to_columns;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -35,7 +37,6 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     }
 
     // --- Methods moved from old IndexProvider trait ---
-
     /// Returns a set of column names that are indexed by any of the indexes
     /// returned by `indexes()`.
     /// The default implementation iterates through all indexes and collects
@@ -50,13 +51,87 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         Ok(all_indexed_columns)
     }
 
-    /// Optimizes a list of expressions by combining them when possible
-    /// For example, multiple expressions on the same column could be combined into a single expression
-    /// Returns a new list of optimized expressions
-    /// TODO: Implement actual optimization logic if needed.
-    fn optimize_exprs(&self, exprs: &[Expr]) -> Result<Vec<Expr>> {
-        // Default implementation returns expressions as-is
-        Ok(exprs.to_vec())
+    /// Analyzes filters, optimizes those suitable for index pushdown, and separates remaining filters.
+    ///
+    /// Takes a slice of all filters applied to the scan and returns a tuple:
+    ///  - `Vec<Expr>`: Optimized filters potentially suitable for index lookup.
+    ///  - `Vec<Expr>`: Filters that could not be pushed down to an index.
+    ///
+    /// The default implementation identifies filters on indexed columns and attempts
+    /// simple optimizations like combining range comparisons into BETWEEN clauses.
+    fn analyze_and_optimize_filters(&self, filters: &[Expr]) -> Result<(Vec<Expr>, Vec<Expr>)> {
+        let mut potential_index_filters = Vec::new();
+        let mut remaining_filters = Vec::new();
+
+        // 1. Initial pass: Identify potential candidates using the helper method
+        for filter in filters {
+            if self.identify_index_pushdown_candidate(filter)? {
+                potential_index_filters.push(filter.clone());
+            } else {
+                remaining_filters.push(filter.clone());
+            }
+        }
+
+        // 2. Group potential candidates by column name
+        let (column_grouped_filters, ungrouped_potential_filters) =
+            group_potential_index_filters_by_column(potential_index_filters);
+
+        // 3. Optimize each group using the helper method
+        let mut optimized_index_filters = Vec::new();
+        for (col_name, col_exprs) in column_grouped_filters {
+            let optimized_group = self.optimize_column_filters(&col_name, &col_exprs)?;
+            optimized_index_filters.extend(optimized_group);
+        }
+
+        // 4. Add ungrouped potential filters to optimized_index_filters directly
+        //    (They were identified as candidates but couldn't be optimized further by column)
+        optimized_index_filters.extend(ungrouped_potential_filters);
+
+        Ok((optimized_index_filters, remaining_filters))
+    }
+
+    /// Determines if a single filter expression is potentially suitable for index pushdown.
+    ///
+    /// This is called *before* grouping or optimization. Implementers can override this
+    /// to define which basic expression shapes their indexes might support.
+    ///
+    /// Default implementation checks for BinaryExpr `Column Op Literal` where the column is indexed.
+    fn identify_index_pushdown_candidate(&self, filter: &Expr) -> Result<bool> {
+        if let Expr::BinaryExpr(binary) = filter {
+            if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
+                // Check if the column itself is indexed
+                let indexed_columns = self.get_indexed_columns_names()?;
+                if indexed_columns.contains(&col.name) {
+                    // TODO: Could add more checks here based on the operator (binary.op)
+                    //       or the literal type if needed by default.
+                    return Ok(true);
+                }
+            }
+            // Could potentially add checks for other Expr types like InList, Between here.
+        }
+        Ok(false)
+    }
+
+    /// Optimizes a set of filter expressions that apply to the *same* indexed column.
+    ///
+    /// This is called *after* initial candidates are identified and grouped by column.
+    /// Implementers can override this to provide custom combination logic (e.g., range -> BETWEEN).
+    ///
+    /// Default implementation currently returns the filters as-is, but includes a placeholder
+    /// for combination logic like `try_combine_exprs_to_between`.
+    fn optimize_column_filters(&self, _col_name: &str, filters: &[Expr]) -> Result<Vec<Expr>> {
+        if filters.len() > 1 {
+            // Placeholder for combination logic
+            // let filters_refs: Vec<&Expr> = filters.iter().collect();
+            // if let Some(combined) = try_combine_exprs_to_between(filters_refs.as_slice(), _col_name) {
+            //     return Ok(combined);
+            // }
+            // Fallback: return original filters if no combination possible
+            Ok(filters.to_vec())
+            // TODO: Re-enable or implement try_combine_exprs_to_between or other optimizations
+        } else {
+            Ok(filters.to_vec())
+        }
     }
 
     /// Creates an IndexLookupExec for the given filter expression.
@@ -64,16 +139,16 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     /// and then calling the `scan` method on that index.
     /// The exact implementation might vary.
     /// Placeholder: Needs implementation details based on planner interaction.
-    fn create_index_lookup(&self, expr: &Expr) -> Result<Arc<dyn ExecutionPlan>>;
+    fn create_index_scan_exec_for_expr(&self, _expr: &Expr) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Creates an execution plan that combines multiple index lookups (if necessary)
     /// and joins the results with the base table data.
     /// Default implementation might use HashJoinExec or a custom IndexJoinExec.
     /// Placeholder: Needs implementation details.
-    fn create_index_join(
+    fn merge_indexes_streams(
         &self,
-        lookups: Vec<Arc<dyn ExecutionPlan>>, // Results of create_index_lookup
-        projection: Option<&Vec<usize>>,      // Projection for the final table data
+        _lookups: Vec<Arc<dyn ExecutionPlan>>, // Results of create_index_lookup
+        _projection: Option<&Vec<usize>>,      // Projection for the final table data
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Overloads the `supports_filters_pushdown` method from `TableProvider` to take advantage of indexes.
@@ -118,11 +193,44 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     // or to handle index-specific DDL/DML operations.
 }
 
+/// Helper function to group potential index filters by the column they reference.
+/// Filters that cannot be easily associated with a single column are returned separately.
+fn group_potential_index_filters_by_column(
+    potential_filters: Vec<Expr>,
+) -> (HashMap<String, Vec<Expr>>, Vec<Expr>) {
+    let mut column_grouped_filters: HashMap<String, Vec<Expr>> = HashMap::new();
+    let mut ungrouped_potential_filters = Vec::new();
+
+    for expr in potential_filters {
+        let mut columns = HashSet::new();
+        match expr_to_columns(&expr, &mut columns) {
+            Ok(_) if columns.len() == 1 => {
+                // If exactly one column is referenced, use its name for grouping
+                if let Some(col) = columns.iter().next() {
+                    column_grouped_filters
+                        .entry(col.name.clone())
+                        .or_default()
+                        .push(expr); // Move expr here
+                } else {
+                    // Should not happen if len is 1, but handle defensively
+                    ungrouped_potential_filters.push(expr);
+                }
+            }
+            _ => {
+                // Error converting or zero/multiple columns found
+                ungrouped_potential_filters.push(expr);
+            }
+        }
+    }
+
+    (column_grouped_filters, ungrouped_potential_filters)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::physical::indexes::index::Index;
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::catalog::{Session, TableProvider}; // Keep Session for trait bounds/scan signature
     use datafusion::datasource::TableType;
@@ -130,7 +238,6 @@ mod tests {
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
     use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, Statistics};
     use datafusion_common::Column;
-    use lazy_static::lazy_static;
     use std::any::Any;
     use std::sync::Arc;
 
@@ -138,16 +245,8 @@ mod tests {
     #[derive(Debug)]
     struct MockSimpleIndex {
         name: String,
-        supports: bool,    // Controls supports_predicate result
-        schema: SchemaRef, // Add schema field
-    }
-
-    lazy_static! {
-        static ref DUMMY_SCHEMA: SchemaRef = Arc::new(Schema::empty());
-        // Schema for mock index tests, including col_a
-        static ref MOCK_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("col_a", DataType::Int32, false),
-        ]));
+        supports: bool,      // Controls supports_predicate result
+        schema: Arc<Schema>, // Use SchemaRef (Arc<Schema>)
     }
 
     impl Index for MockSimpleIndex {
@@ -163,8 +262,8 @@ mod tests {
         }
 
         // Return the index's specific schema
-        fn index_schema(&self) -> SchemaRef {
-            self.schema.clone()
+        fn index_schema(&self) -> Arc<Schema> {
+            self.schema.clone() // Clone the Arc
         }
 
         fn supports_predicate(&self, _predicate: &Expr) -> Result<bool> {
@@ -181,14 +280,14 @@ mod tests {
 
         // Use index schema for statistics
         fn statistics(&self) -> Statistics {
-            Statistics::new_unknown(&self.index_schema())
+            Statistics::new_unknown(&self.index_schema()) // Use the method returning Arc
         }
     }
 
     // --- Mock Base Table Provider ---
     #[derive(Debug)]
     struct MockBaseTableProvider {
-        schema: SchemaRef,
+        schema: Arc<Schema>, // Use SchemaRef (Arc<Schema>)
     }
 
     impl MockBaseTableProvider {
@@ -208,8 +307,8 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
-        fn schema(&self) -> SchemaRef {
-            self.schema.clone()
+        fn schema(&self) -> Arc<Schema> {
+            self.schema.clone() // Clone the Arc
         }
         fn table_type(&self) -> TableType {
             TableType::Base
@@ -268,12 +367,12 @@ mod tests {
             Ok(self.indexes.clone())
         }
 
-        // Correct signature for create_index_lookup
-        fn create_index_lookup(&self, _expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
-            unimplemented!("Mock does not implement create_index_lookup")
+        // Correct signature for create_index_scan_exec_for_expr
+        fn create_index_scan_exec_for_expr(&self, _expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
+            unimplemented!("Mock create_index_scan_exec_for_expr")
         }
         // Correct signature for create_index_join
-        fn create_index_join(
+        fn merge_indexes_streams(
             &self,
             _lookups: Vec<Arc<dyn ExecutionPlan>>,
             _projection: Option<&Vec<usize>>,
@@ -330,8 +429,8 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
-        fn schema(&self) -> SchemaRef {
-            self.base_provider.schema()
+        fn schema(&self) -> Arc<Schema> {
+            self.base_provider.schema() // Call the method returning Arc
         }
         fn table_type(&self) -> TableType {
             self.base_provider.table_type()
@@ -355,12 +454,20 @@ mod tests {
         let index_supports = Arc::new(MockSimpleIndex {
             name: "idx_supports".to_string(),
             supports: true,
-            schema: MOCK_INDEX_SCHEMA.clone(),
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "col_a",
+                DataType::Int32,
+                false,
+            )])),
         });
         let index_no_support = Arc::new(MockSimpleIndex {
             name: "idx_no_support".to_string(),
             supports: false,
-            schema: MOCK_INDEX_SCHEMA.clone(),
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "col_a",
+                DataType::Int32,
+                false,
+            )])),
         });
         let provider = MockIndexedTable::new(vec![index_supports.clone(), index_no_support]);
 
@@ -380,12 +487,20 @@ mod tests {
         let index_supports = Arc::new(MockSimpleIndex {
             name: "idx_supports".to_string(),
             supports: true,
-            schema: MOCK_INDEX_SCHEMA.clone(),
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "col_a",
+                DataType::Int32,
+                false,
+            )])),
         });
         let index_no_support = Arc::new(MockSimpleIndex {
             name: "idx_no_support".to_string(),
             supports: false,
-            schema: MOCK_INDEX_SCHEMA.clone(),
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "col_a",
+                DataType::Int32,
+                false,
+            )])),
         });
         let provider_supports = MockIndexedTable::new_with_pushdown(
             vec![index_supports.clone(), index_no_support.clone()],

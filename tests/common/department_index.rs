@@ -54,8 +54,14 @@ impl DepartmentIndex {
             Operator::NotEq => {
                 // Combine IDs from values less than val and greater than val
                 // Note: BTreeMap iterates strings lexicographically
-                let range1 = self.index.range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(val.to_string())));
-                let range2 = self.index.range((std::ops::Bound::Excluded(val.to_string()), std::ops::Bound::Unbounded));
+                let range1 = self.index.range((
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Excluded(val.to_string()),
+                ));
+                let range2 = self.index.range((
+                    std::ops::Bound::Excluded(val.to_string()),
+                    std::ops::Bound::Unbounded,
+                ));
                 for (_, ids) in range1.chain(range2) {
                     matching_ids.extend(ids.iter().copied());
                 }
@@ -133,7 +139,6 @@ impl Index for DepartmentIndex {
             );
         }
         // --- End Predicate Parsing ---
-
 
         // --- Construct RecordBatch Stream ---
         if matching_ids.is_empty() {

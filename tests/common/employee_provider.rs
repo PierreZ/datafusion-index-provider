@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::{any::Any, sync::Arc};
 
 use arrow::array::{Int32Array, StringArray};
@@ -12,14 +12,14 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan};
 use datafusion::scalar::ScalarValue;
-use datafusion_index_provider::optimizer::try_combine_exprs_to_between;
 use datafusion_index_provider::physical::indexes::index::Index;
+use datafusion_index_provider::physical::indexes::scan::index_scan_schema;
 use datafusion_index_provider::physical::joins::try_create_lookup_join;
 use datafusion_index_provider::provider::IndexedTableProvider;
 
-use super::exec::{IndexJoinExec, IndexLookupExec};
-use super::age_index::AgeIndex;
-use super::department_index::DepartmentIndex;
+use crate::common::age_index::AgeIndex;
+use crate::common::department_index::DepartmentIndex;
+use crate::common::exec::{IndexJoinExec, IndexLookupExec};
 
 /// A simple in-memory table provider that stores employee data with an age index
 #[derive(Debug)]
@@ -44,48 +44,7 @@ impl IndexedTableProvider for EmployeeTableProvider {
         Ok(columns)
     }
 
-    fn optimize_exprs(&self, exprs: &[Expr]) -> Result<Vec<Expr>> {
-        // Group expressions by column
-        let mut column_exprs: HashMap<String, Vec<&Expr>> = HashMap::new();
-        let mut optimized = Vec::new();
-
-        for expr in exprs {
-            if let Expr::BinaryExpr(binary) = expr {
-                if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
-                    if self
-                        .get_indexed_columns_names()
-                        .unwrap()
-                        .contains(&col.name)
-                    {
-                        column_exprs.entry(col.name.clone()).or_default().push(expr);
-                        continue;
-                    }
-                }
-            }
-            // If not a binary expression or not supported by index, keep as is
-            optimized.push(expr.clone());
-        }
-
-        // Process expressions for each column
-        for (col_name, col_exprs) in column_exprs {
-            if col_exprs.len() > 1 {
-                // Try to combine expressions into bounds
-                if let Some(combined) = try_combine_exprs_to_between(&col_exprs, &col_name) {
-                    optimized.extend(combined);
-                } else {
-                    // If we couldn't combine them, keep them as is
-                    optimized.extend(col_exprs.into_iter().cloned());
-                }
-            } else {
-                // For single expressions, keep them as is
-                optimized.extend(col_exprs.into_iter().cloned());
-            }
-        }
-
-        Ok(optimized)
-    }
-
-    fn create_index_lookup(&self, expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
+    fn create_index_scan_exec_for_expr(&self, expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
         log::debug!("Creating index lookup for expression: {:?}", expr);
         match expr {
             Expr::BinaryExpr(binary) => match (binary.left.as_ref(), binary.right.as_ref()) {
@@ -100,11 +59,7 @@ impl IndexedTableProvider for EmployeeTableProvider {
                         _ => return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty())))),
                     };
 
-                    let index_schema = Arc::new(Schema::new(vec![Field::new(
-                        "index",
-                        DataType::UInt64,
-                        false,
-                    )]));
+                    let index_schema = index_scan_schema(DataType::UInt64);
 
                     Ok(Arc::new(IndexLookupExec::new(
                         index_schema,
@@ -116,8 +71,8 @@ impl IndexedTableProvider for EmployeeTableProvider {
                     let left_expr = Expr::BinaryExpr(left.clone());
                     let right_expr = Expr::BinaryExpr(right.clone());
 
-                    let left_exec = self.create_index_lookup(&left_expr)?;
-                    let right_exec = self.create_index_lookup(&right_expr)?;
+                    let left_exec = self.create_index_scan_exec_for_expr(&left_expr)?;
+                    let right_exec = self.create_index_scan_exec_for_expr(&right_expr)?;
 
                     log::debug!("Combining OR expression with UnionExec");
                     Ok(Arc::new(UnionExec::new(vec![left_exec, right_exec])))
@@ -138,11 +93,7 @@ impl IndexedTableProvider for EmployeeTableProvider {
                             let filtered_indices: Vec<u64> =
                                 self.age_index.filter_rows_range(*low, *high);
 
-                            let index_schema = Arc::new(Schema::new(vec![Field::new(
-                                "index",
-                                DataType::UInt64,
-                                false,
-                            )]));
+                            let index_schema = index_scan_schema(DataType::UInt64);
 
                             return Ok(Arc::new(IndexLookupExec::new(
                                 index_schema,
@@ -158,7 +109,7 @@ impl IndexedTableProvider for EmployeeTableProvider {
         }
     }
 
-    fn create_index_join(
+    fn merge_indexes_streams(
         &self,
         lookups: Vec<Arc<dyn ExecutionPlan>>,
         projection: Option<&Vec<usize>>,
@@ -249,7 +200,10 @@ impl EmployeeTableProvider {
             batches: vec![batch],
             age_index: age_index.clone(),
             department_index: department_index.clone(),
-            indexes: vec![age_index, department_index],
+            indexes: vec![
+                age_index as Arc<dyn Index>,
+                department_index as Arc<dyn Index>,
+            ],
         }
     }
 }
@@ -283,99 +237,61 @@ impl TableProvider for EmployeeTableProvider {
         );
 
         // Step 1: Analyze Filters and Optimize
-        let mut index_filters = Vec::new();
-        let mut remaining_filters = Vec::new();
-        let indexed_columns = self.get_indexed_columns_names().unwrap();
-
-        for filter in filters {
-            let mut pushed_down = false;
-            if let Expr::BinaryExpr(binary) = filter {
-                if let Expr::Column(col) = &*binary.left {
-                    if indexed_columns.contains(&col.name) {
-                        index_filters.push(filter.clone());
-                        pushed_down = true;
-                    }
-                }
-            }
-            // Add other indexable patterns here (e.g., BETWEEN on indexed columns)
-            // ... TBD ...
-
-            if !pushed_down {
-                remaining_filters.push(filter.clone());
-            }
-        }
-
-        // --- Optimization logic adapted from `optimize_exprs` ---
-        let mut optimized_index_filters = Vec::new();
-        let mut column_exprs: HashMap<String, Vec<Expr>> = HashMap::new();
-
-        for expr in &index_filters {
-            // Iterate over collected index filters
-            if let Expr::BinaryExpr(binary) = expr {
-                if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
-                    if indexed_columns.contains(&col.name) {
-                        // Group by column name
-                        column_exprs
-                            .entry(col.name.clone())
-                            .or_default()
-                            .push(expr.clone());
-                        continue; // Skip adding to optimized_index_filters directly
-                    }
-                }
-            }
-            // If not a binary expression on an indexed column, or can't be grouped, add directly
-            optimized_index_filters.push(expr.clone());
-        }
-
-        // Process grouped expressions for optimization (e.g., BETWEEN)
-        for (col_name, col_exprs) in column_exprs {
-            if col_exprs.len() > 1 {
-                // Try to combine expressions into bounds
-                let col_exprs_refs: Vec<&Expr> = col_exprs.iter().collect(); // Collect references
-                if let Some(combined) =
-                    try_combine_exprs_to_between(col_exprs_refs.as_slice(), &col_name)
-                {
-                    // Pass as slice
-                    optimized_index_filters.extend(combined);
-                } else {
-                    // If we couldn't combine them, keep them as is
-                    optimized_index_filters.extend(col_exprs);
-                }
-            } else {
-                // For single expressions, keep them as is
-                optimized_index_filters.extend(col_exprs);
-            }
-        }
-        // --- End Optimization logic ---
+        let (optimized_index_filters, _remaining_filters) =
+            self.analyze_and_optimize_filters(filters)?;
+        // TODO: Use remaining_filters later, perhaps in FilterExec after the index scan/join
 
         log::debug!("Optimized index filters: {:?}", optimized_index_filters);
-        log::debug!("Remaining filters: {:?}", remaining_filters);
 
-        // TODO: Step 2: Build Index Scan Plan(s) (adapt create_index_lookup -> IndexScanExec)
-        // - Use `optimized_index_filters` here
-        // Temporary: Return empty plan until implemented
-        let base_schema = self.schema(); // Or apply projection
-        Ok(Arc::new(EmptyExec::new(base_schema)))
+        // Step 2: Build Index Scan Plan(s)
+        let index_scan_plans: Vec<Arc<dyn ExecutionPlan>> = optimized_index_filters
+            .iter()
+            .map(|filter| self.create_index_scan_exec_for_expr(filter))
+            .collect::<Result<Vec<_>>>()?; // Collect results, propagating errors
+
+        log::debug!("Created {} index scan plans", index_scan_plans.len());
+
+        // Step 3: Build Index Join Plan or Fallback
+        if index_scan_plans.is_empty() {
+            Err(DataFusionError::Internal(
+                "No index filters applicable".to_string(),
+            ))
+        } else {
+            // Use the created index scan plans to build the join
+            log::debug!(
+                "Creating index join plan with {} lookup(s)",
+                index_scan_plans.len()
+            );
+            self.merge_indexes_streams(index_scan_plans, projection)
+        }
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        let indexed_columns = self.get_indexed_columns_names().unwrap();
+        // For this test provider, we *only* support filters handled by indexes.
+        let indexed_columns = self.get_indexed_columns_names()?;
         let results = filters
             .iter()
             .map(|filter| {
                 let cols = filter.column_refs();
-                if cols.iter().any(|col| indexed_columns.contains(&col.name)) {
-                    // If any part of the filter uses an indexed column, push down exactly
-                    TableProviderFilterPushDown::Exact
+                if cols.is_empty() {
+                    return TableProviderFilterPushDown::Unsupported;
+                }
+                let all_indexed = cols.iter().all(|c| indexed_columns.contains(&c.name));
+                if all_indexed {
+                    // Check if the *specific* expression is supported by *any* index
+                    // (this uses the default logic from IndexedTableProvider for simplicity here)
+                    match self.find_suitable_indexes(filter) {
+                        Ok(indexes) if !indexes.is_empty() => TableProviderFilterPushDown::Exact,
+                        _ => TableProviderFilterPushDown::Unsupported,
+                    }
                 } else {
-                    // Otherwise, the provider cannot handle it
                     TableProviderFilterPushDown::Unsupported
                 }
             })
-            .collect::<Vec<_>>();
+            .collect();
         Ok(results)
     }
 }

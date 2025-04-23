@@ -14,3 +14,4 @@ pub const ROW_ID_COLUMN_NAME: &str = "__row_id__";
 pub mod optimizer;
 pub mod physical;
 pub mod provider;
+pub mod record_fetch;

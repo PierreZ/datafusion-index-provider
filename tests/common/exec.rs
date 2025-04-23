@@ -1,25 +1,28 @@
-use arrow::array::{Array, UInt64Array};
+use arrow::array::UInt64Array;
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use futures::{stream::StreamExt, TryFutureExt};
+use datafusion_index_provider::record_fetch::RecordFetchStream;
+
 use std::any::Any;
-use std::collections::HashSet;
+
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use crate::common::record_fetcher::BatchMapper;
+
+/// Compute properties for a plan that produces output sorted by the 'index' column.
 pub fn compute_properties(schema: SchemaRef) -> PlanProperties {
     let eq_properties = EquivalenceProperties::new(schema.clone());
     PlanProperties::new(
@@ -64,6 +67,7 @@ pub struct IndexLookupExec {
     schema: SchemaRef,
     filtered_indices: Vec<u64>,
     cache: PlanProperties,
+    sorted: bool, // Add sorted field
 }
 
 impl IndexLookupExec {
@@ -77,13 +81,20 @@ impl IndexLookupExec {
             schema: schema.clone(),
             filtered_indices,
             cache,
+            sorted, // Store sorted flag
         }
     }
 }
 
 impl DisplayAs for IndexLookupExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "IndexLookupExec")
+        // Include index count and sorted status
+        write!(
+            f,
+            "IndexLookupExec: indices_count={}, sorted={}",
+            self.filtered_indices.len(),
+            self.sorted
+        )
     }
 }
 
@@ -171,8 +182,29 @@ impl IndexJoinExec {
 }
 
 impl DisplayAs for IndexJoinExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "IndexJoinExec")
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "IndexJoinExec: projection={}, batches={}",
+                    self.projection.is_some(), // Show if projection is applied
+                    self.batches.len()         // Show number of base batches
+                )?;
+                // Optionally, in verbose mode, display the child plan
+                // Use pattern matching for enum comparison
+                if matches!(
+                    t,
+                    DisplayFormatType::Verbose | DisplayFormatType::TreeRender
+                ) {
+                    write!(f, ", child=")?;
+                    self.index_exec.fmt_as(t, f)?; // Display child plan details
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -212,86 +244,19 @@ impl ExecutionPlan for IndexJoinExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let _index_schema = self.index_exec.schema();
-        let base_schema = self.schema.clone();
         let index_stream_partitioned = self.index_exec.execute(partition, context.clone())?;
 
-        let base_batches = self
-            .batches
-            .iter()
-            .map(|batch| Ok(batch.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let base_stream_partitioned = MemoryStream::try_new(base_batches, base_schema, None)?;
+        // Create BatchMapper instance
+        let mapper = BatchMapper::new(self.batches.clone());
 
-        let stream = Box::pin(
-            async move {
-                // 1. Collect all row IDs from the index stream
-                let mut row_ids = HashSet::new();
-                let mut index_stream_concrete = index_stream_partitioned;
-                while let Some(batch_result) = index_stream_concrete.next().await {
-                    let batch = batch_result?;
-                    // Assuming the index stream returns a single UInt64 column named "_row_id"
-                    let row_id_col = batch
-                        .column_by_name("_row_id")
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "Index stream missing _row_id column".to_string(),
-                            )
-                        })?
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "Index stream _row_id column is not UInt64Array".to_string(),
-                            )
-                        })?;
-
-                    for row_id in row_id_col.values().iter() {
-                        row_ids.insert(*row_id);
-                    }
-                }
-
-                // 2. Filter the base stream using the collected row IDs
-                let base_stream_filtered = base_stream_partitioned.map(move |batch_result| {
-                    let batch = batch_result?;
-                    // Find the _row_id column in the base batch
-                    let base_row_id_col = batch
-                        .column_by_name("_row_id")
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "Base stream missing _row_id column".to_string(),
-                            )
-                        })?
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "Base stream _row_id column is not UInt64Array".to_string(),
-                            )
-                        })?;
-
-                    // Create a boolean filter array
-                    let filter_array = base_row_id_col
-                        .iter()
-                        .map(|row_id_opt| {
-                            row_id_opt.map_or(None, |row_id| Some(row_ids.contains(&row_id)))
-                        })
-                        .collect::<arrow::array::BooleanArray>();
-
-                    // Apply the filter
-                    let filtered_batch =
-                        arrow::compute::filter_record_batch(&batch, &filter_array)?;
-                    Ok(filtered_batch)
-                });
-
-                Ok(base_stream_filtered)
-            }
-            .try_flatten_stream(),
+        // Create RecordFetchStream
+        let stream = RecordFetchStream::new(
+            index_stream_partitioned,
+            partition, // Pass the partition number
+            Box::new(mapper),
         );
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema(),
-            stream,
-        )))
+        Ok(Box::pin(stream))
     }
 
     fn statistics(&self) -> Result<Statistics> {

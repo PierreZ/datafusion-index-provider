@@ -9,6 +9,8 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
+const ROW_ID_COLUMN_NAME: &str = "__row_id__";
+
 /// Attempts to join two index lookup execution plans.
 /// Chooses SortMergeJoinExec if both inputs report sorted output on the 'index' column,
 /// otherwise uses HashJoinExec.
@@ -16,12 +18,16 @@ pub fn try_create_lookup_join(
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    // Define join columns ("index")
-    let left_col = Arc::new(PhysicalColumn::new("index", 0)) as Arc<dyn PhysicalExpr>;
-    let right_col = Arc::new(PhysicalColumn::new("index", 0)) as Arc<dyn PhysicalExpr>;
-    let join_on = vec![(left_col, right_col)];
+    // Assuming both inputs have the row ID column at index 0
+    let left_col = PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0);
+    let right_col = PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0);
 
-    // Check if both inputs are sorted on the join key ('index' column)
+    // Wrap columns in Arc<dyn PhysicalExpr> for the join functions
+    let left_col_expr = Arc::new(left_col) as Arc<dyn PhysicalExpr>;
+    let right_col_expr = Arc::new(right_col) as Arc<dyn PhysicalExpr>;
+    let join_on = vec![(left_col_expr, right_col_expr)];
+
+    // Check if both inputs are sorted on the join key ('__row_id__' column)
     let left_ordering = left.output_ordering();
     let right_ordering = right.output_ordering();
 
@@ -35,13 +41,13 @@ pub fn try_create_lookup_join(
                     .expr
                     .as_any()
                     .downcast_ref::<PhysicalColumn>()
-                    .map(|c| c.name() == "index")
+                    .map(|c| c.name() == ROW_ID_COLUMN_NAME)
                     .unwrap_or(false)
                 && ro[0]
                     .expr
                     .as_any()
                     .downcast_ref::<PhysicalColumn>()
-                    .map(|c| c.name() == "index")
+                    .map(|c| c.name() == ROW_ID_COLUMN_NAME)
                     .unwrap_or(false)
         }
         _ => false,
@@ -54,19 +60,19 @@ pub fn try_create_lookup_join(
         Ok(Arc::new(SortMergeJoinExec::try_new(
             left.clone(),
             right.clone(),
-            join_on, // on: JoinOn
-            None,    // filter: Option<JoinFilter>
-            JoinType::Inner,
-            vec![left_ordering.unwrap()[0].options], // sort_options: Vec<SortOptions>
-            false,                                   // null_equals_null: bool
+            join_on,                                 // on: JoinOn
+            None,                                    // filter: Option<JoinFilter>
+            JoinType::Inner,                         // Use Inner join for intersection
+            vec![left_ordering.unwrap()[0].options], // Extract SortOptions
+            false,                                   // null_equals_null is false for standard joins
         )?))
     } else {
         // Use HashJoinExec
         Ok(Arc::new(HashJoinExec::try_new(
             left.clone(),
             right.clone(),
-            join_on, // on: JoinOn
-            None,    // filter: Option<JoinFilter>
+            join_on,
+            None, // No filter
             &JoinType::Inner,
             None, // projection: Option<Vec<usize>>
             PartitionMode::CollectLeft,
