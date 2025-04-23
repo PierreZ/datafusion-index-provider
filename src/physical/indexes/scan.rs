@@ -32,15 +32,12 @@ impl IndexScanExec {
         )]));
 
         let eq_properties = EquivalenceProperties::new(schema.clone());
-        let partitioning = Partitioning::UnknownPartitioning(1);
-        let boundedness = Boundedness::Bounded;
+        let partitioning = Partitioning::UnknownPartitioning(1); // TODO: Determine partitioning based on index
+        let emission_type = EmissionType::Incremental; // Index scan produces batches incrementally
+        let boundedness = Boundedness::Bounded; // Use Bounded until calculation is implemented
 
-        let properties = PlanProperties::new(
-            eq_properties,
-            partitioning,
-            EmissionType::Incremental, // Corrected: Use Incremental
-            boundedness,
-        );
+        let properties =
+            PlanProperties::new(eq_properties, partitioning, emission_type, boundedness);
 
         Ok(Self {
             index,

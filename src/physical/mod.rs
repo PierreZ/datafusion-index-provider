@@ -1,11 +1,9 @@
-//! Physical execution components for index operations.
+//! Physical plans and operators for index-based data access
 //!
-//! This module contains the physical execution components needed to perform
-//! index-based operations in DataFusion, including:
-//!
-//! * Record fetching - Converting index entries to actual records
+//! This module contains:
+//! * Index scanning - Generating row IDs from index lookups
+//! * Record fetching - Converting index entries to actual records (Removed, handled by Join)
 //! * Stream processing - Handling record batches in a streaming fashion
 
 pub mod indexes;
 pub mod joins;
-pub mod record_fetch;

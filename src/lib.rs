@@ -72,3 +72,6 @@ pub trait IndexProvider: TableProvider {
         Ok(pushdowns)
     }
 }
+
+/// Column name used to store internal Row IDs for joining index results.
+pub const ROW_ID_COLUMN_NAME: &str = "__row_id__";

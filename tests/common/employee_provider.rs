@@ -123,7 +123,7 @@ impl IndexProvider for EmployeeTableProvider {
                     ) = (between.low.as_ref(), between.high.as_ref())
                     {
                         if col.name == "age" {
-                            let filtered_indices: Vec<usize> =
+                            let filtered_indices: Vec<u64> =
                                 self.age_index.filter_rows_range(*low, *high);
 
                             let index_schema = Arc::new(Schema::new(vec![Field::new(
@@ -257,23 +257,89 @@ impl TableProvider for EmployeeTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        log::debug!("Passed {} filters. Filters: {:?}", filters.len(), filters);
-        // First optimize the expressions
-        let optimized_filters = self.optimize_exprs(filters)?;
+        log::debug!(
+            "EmployeeTableProvider::scan. projection: {:?}, filters: {:?}, limit: {:?}",
+            projection,
+            filters,
+            limit
+        );
 
-        log::debug!("Optimized filters: {:?}", optimized_filters);
+        // Step 1: Analyze Filters and Optimize
+        let mut index_filters = Vec::new();
+        let mut remaining_filters = Vec::new();
+        let indexed_columns = self.get_indexed_columns_names();
 
-        // Create index lookups for each optimized filter
-        let mut lookups = Vec::new();
-        for filter in optimized_filters {
-            let lookup = self.create_index_lookup(&filter)?;
-            lookups.push(lookup);
+        for filter in filters {
+            let mut pushed_down = false;
+            if let Expr::BinaryExpr(binary) = filter {
+                if let Expr::Column(col) = &*binary.left {
+                    if indexed_columns.contains(&col.name) {
+                        index_filters.push(filter.clone());
+                        pushed_down = true;
+                    }
+                }
+            }
+            // Add other indexable patterns here (e.g., BETWEEN on indexed columns)
+            // ... TBD ...
+
+            if !pushed_down {
+                remaining_filters.push(filter.clone());
+            }
         }
 
-        // Create the appropriate join plan based on number of lookups
-        self.create_index_join(lookups, projection)
+        // --- Optimization logic adapted from `optimize_exprs` ---
+        let mut optimized_index_filters = Vec::new();
+        let mut column_exprs: HashMap<String, Vec<Expr>> = HashMap::new();
+
+        for expr in &index_filters {
+            // Iterate over collected index filters
+            if let Expr::BinaryExpr(binary) = expr {
+                if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
+                    if indexed_columns.contains(&col.name) {
+                        // Group by column name
+                        column_exprs
+                            .entry(col.name.clone())
+                            .or_default()
+                            .push(expr.clone());
+                        continue; // Skip adding to optimized_index_filters directly
+                    }
+                }
+            }
+            // If not a binary expression on an indexed column, or can't be grouped, add directly
+            optimized_index_filters.push(expr.clone());
+        }
+
+        // Process grouped expressions for optimization (e.g., BETWEEN)
+        for (col_name, col_exprs) in column_exprs {
+            if col_exprs.len() > 1 {
+                // Try to combine expressions into bounds
+                let col_exprs_refs: Vec<&Expr> = col_exprs.iter().collect(); // Collect references
+                if let Some(combined) =
+                    try_combine_exprs_to_between(col_exprs_refs.as_slice(), &col_name)
+                {
+                    // Pass as slice
+                    optimized_index_filters.extend(combined);
+                } else {
+                    // If we couldn't combine them, keep them as is
+                    optimized_index_filters.extend(col_exprs);
+                }
+            } else {
+                // For single expressions, keep them as is
+                optimized_index_filters.extend(col_exprs);
+            }
+        }
+        // --- End Optimization logic ---
+
+        log::debug!("Optimized index filters: {:?}", optimized_index_filters);
+        log::debug!("Remaining filters: {:?}", remaining_filters);
+
+        // TODO: Step 2: Build Index Scan Plan(s) (adapt create_index_lookup -> IndexScanExec)
+        // - Use `optimized_index_filters` here
+        // Temporary: Return empty plan until implemented
+        let base_schema = self.schema(); // Or apply projection
+        Ok(Arc::new(EmptyExec::new(base_schema)))
     }
 
     fn supports_filters_pushdown(

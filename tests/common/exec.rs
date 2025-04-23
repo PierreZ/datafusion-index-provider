@@ -1,23 +1,26 @@
 use arrow::array::{Array, Int32Array, UInt64Array};
+use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_index_provider::physical::record_fetch::{RecordFetchStream, RecordFetcher};
+use datafusion_common::DataFusionError;
+use futures::{stream::StreamExt, TryFutureExt};
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-
-use datafusion_common::arrow::compute::SortOptions;
 
 pub fn compute_properties(schema: SchemaRef) -> PlanProperties {
     let eq_properties = EquivalenceProperties::new(schema.clone());
@@ -62,12 +65,12 @@ pub fn compute_sorted_properties(schema: SchemaRef) -> PlanProperties {
 #[derive(Debug)]
 pub struct IndexLookupExec {
     schema: SchemaRef,
-    filtered_indices: Vec<usize>,
+    filtered_indices: Vec<u64>,
     cache: PlanProperties,
 }
 
 impl IndexLookupExec {
-    pub fn new(schema: SchemaRef, filtered_indices: Vec<usize>) -> Self {
+    pub fn new(schema: SchemaRef, filtered_indices: Vec<u64>) -> Self {
         IndexLookupExec {
             schema: schema.clone(),
             filtered_indices,
@@ -77,7 +80,7 @@ impl IndexLookupExec {
     }
 
     /// Create a new IndexLookupExec assuming its output *is* sorted by index.
-    pub fn new_sorted(schema: SchemaRef, filtered_indices: Vec<usize>) -> Self {
+    pub fn new_sorted(schema: SchemaRef, filtered_indices: Vec<u64>) -> Self {
         IndexLookupExec {
             schema: schema.clone(),
             filtered_indices,
@@ -128,8 +131,7 @@ impl ExecutionPlan for IndexLookupExec {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         // Convert indices to RecordBatch
-        let indices =
-            UInt64Array::from_iter_values(self.filtered_indices.iter().map(|&i| i as u64));
+        let indices = UInt64Array::from_iter_values(self.filtered_indices.iter().copied());
         let batch = RecordBatch::try_new(self.schema.clone(), vec![Arc::new(indices)])?;
 
         log::debug!("index lookup Batch: {:?}", batch);
@@ -150,37 +152,7 @@ impl ExecutionPlan for IndexLookupExec {
     }
 }
 
-/// Mapper that filters batches using index results
-struct BatchMapper {
-    batches: Vec<RecordBatch>,
-}
-
-impl BatchMapper {
-    fn new(batches: Vec<RecordBatch>) -> Self {
-        Self { batches }
-    }
-}
-
-#[async_trait]
-impl RecordFetcher for BatchMapper {
-    async fn fetch_record(&mut self, index_batch: RecordBatch) -> Result<RecordBatch> {
-        log::debug!("Index batch: {:?}", index_batch);
-        // Get row indices from the index batch
-        let indices = index_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let row_ids: Vec<usize> = indices.iter().flatten().map(|i| i as usize).collect();
-
-        log::debug!("Row ids: {:?}", row_ids);
-
-        // Apply the row filter to get filtered batch
-        apply_row_filter(&self.batches[0], &row_ids)
-    }
-}
-
-/// Execution plan that joins index results with actual data
+/// Joins the results from an index scan (row IDs) with the base data.
 #[derive(Debug)]
 pub struct IndexJoinExec {
     index_exec: Arc<dyn ExecutionPlan>,
@@ -248,17 +220,86 @@ impl ExecutionPlan for IndexJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        // Execute index lookup to get the row indices
-        let index_stream = self.index_exec.execute(partition, context.clone())?;
+        let _index_schema = self.index_exec.schema();
+        let base_schema = self.schema.clone();
+        let index_stream_partitioned = self.index_exec.execute(partition, context.clone())?;
 
-        // Create a mapper that will use the index results to filter batches
-        let mapper = Box::new(BatchMapper::new(self.batches.clone()));
+        let base_batches = self
+            .batches
+            .iter()
+            .map(|batch| Ok(batch.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let base_stream_partitioned = MemoryStream::try_new(base_batches, base_schema, None)?;
 
-        // Create and return a RecordFetchStream that combines the index results with the actual data
-        Ok(Box::pin(RecordFetchStream::new(
-            index_stream,
-            partition,
-            mapper,
+        let stream = Box::pin(
+            async move {
+                // 1. Collect all row IDs from the index stream
+                let mut row_ids = HashSet::new();
+                let mut index_stream_concrete = index_stream_partitioned;
+                while let Some(batch_result) = index_stream_concrete.next().await {
+                    let batch = batch_result?;
+                    // Assuming the index stream returns a single UInt64 column named "_row_id"
+                    let row_id_col = batch
+                        .column_by_name("_row_id")
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "Index stream missing _row_id column".to_string(),
+                            )
+                        })?
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "Index stream _row_id column is not UInt64Array".to_string(),
+                            )
+                        })?;
+
+                    for row_id in row_id_col.values().iter() {
+                        row_ids.insert(*row_id);
+                    }
+                }
+
+                // 2. Filter the base stream using the collected row IDs
+                let base_stream_filtered = base_stream_partitioned.map(move |batch_result| {
+                    let batch = batch_result?;
+                    // Find the _row_id column in the base batch
+                    let base_row_id_col = batch
+                        .column_by_name("_row_id")
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "Base stream missing _row_id column".to_string(),
+                            )
+                        })?
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "Base stream _row_id column is not UInt64Array".to_string(),
+                            )
+                        })?;
+
+                    // Create a boolean filter array
+                    let filter_array = base_row_id_col
+                        .iter()
+                        .map(|row_id_opt| {
+                            row_id_opt.map_or(None, |row_id| Some(row_ids.contains(&row_id)))
+                        })
+                        .collect::<arrow::array::BooleanArray>();
+
+                    // Apply the filter
+                    let filtered_batch =
+                        arrow::compute::filter_record_batch(&batch, &filter_array)?;
+                    Ok(filtered_batch)
+                });
+
+                Ok(base_stream_filtered)
+            }
+            .try_flatten_stream(),
+        );
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
         )))
     }
 
