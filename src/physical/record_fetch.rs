@@ -27,36 +27,30 @@ pub trait RecordFetcher: Send + Sync {
 /// This stream takes an input stream of index entries and uses a RecordFetcher
 /// to convert those entries into actual data records.
 pub struct RecordFetchStream {
-    /// Input execution plan
-    input: Option<SendableRecordBatchStream>,
-    /// Copy of the data schema
-    data_schema: SchemaRef,
-    /// Execution time metrics
+    input: SendableRecordBatchStream, // Input stream providing index batches
+    output_schema: SchemaRef,         // Schema of the RecordBatches yielded by this stream
     baseline_metrics: BaselineMetrics,
-    /// Mapper used to convert an index record entry to an Record entry
-    mapper: Box<dyn RecordFetcher>,
+    fetcher: Box<dyn RecordFetcher>, // Logic to fetch data based on index batch
+    /// Flag to prevent polling input after it returns None or an error
+    input_ended: bool,
 }
 
 impl RecordFetchStream {
     /// Creates a new RecordFetchStream.
-    ///
-    /// # Arguments
-    /// * `input` - The input stream containing index entries
-    /// * `partition` - The partition number for metrics tracking
-    /// * `mapper` - The RecordFetcher implementation that will convert index entries to records
     pub fn new(
         input: SendableRecordBatchStream,
-        partition: usize,
-        mapper: Box<dyn RecordFetcher>,
+        output_schema: SchemaRef,         // Schema of the final output
+        partition: usize,                 // Partition index for metrics
+        fetcher: Box<dyn RecordFetcher>,  // The fetcher implementation
+        metrics: ExecutionPlanMetricsSet, // Parent metrics set
     ) -> Self {
-        let metrics = ExecutionPlanMetricsSet::new();
         let baseline_metrics = BaselineMetrics::new(&metrics, partition);
-        let schema = input.schema();
         Self {
-            input: Some(input),
-            data_schema: schema,
+            input,
+            output_schema, // Store the passed output schema
             baseline_metrics,
-            mapper,
+            fetcher,
+            input_ended: false,
         }
     }
 }
@@ -65,21 +59,30 @@ impl Stream for RecordFetchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let poll = match &mut self.input {
-            // input has been cleared
-            None => Poll::Ready(None),
-            Some(input) => match input.poll_next_unpin(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-                Poll::Ready(Some(Ok(record_batch))) => {
-                    match self.mapper.fetch_record(record_batch).poll_unpin(cx) {
-                        Poll::Ready(record) => Poll::Ready(Some(record)),
-                        Poll::Pending => Poll::Pending,
-                    }
+        if self.input_ended {
+            return Poll::Ready(None);
+        }
+
+        // Poll the input stream
+        let poll = match self.input.poll_next_unpin(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                self.input_ended = true; // Mark input as ended
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.input_ended = true; // Stop polling on error
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(Some(Ok(index_batch))) => {
+                // Got an index batch, now poll the fetcher
+                match self.fetcher.fetch_record(index_batch).poll_unpin(cx) {
+                    Poll::Ready(fetch_result) => Poll::Ready(Some(fetch_result)),
+                    Poll::Pending => Poll::Pending, // Fetcher is not ready yet
                 }
-            },
+            }
         };
+        // Record metrics based on the poll result
         self.baseline_metrics.record_poll(poll)
     }
 }
@@ -87,7 +90,7 @@ impl Stream for RecordFetchStream {
 impl RecordBatchStream for RecordFetchStream {
     /// Returns the schema of the RecordBatches produced by this stream.
     fn schema(&self) -> SchemaRef {
-        self.data_schema.clone()
+        self.output_schema.clone() // Return the correct output schema
     }
 }
 
@@ -171,8 +174,13 @@ mod tests {
 
         let mut mapper = RecordFetchStream::new(
             stream,
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt8, false),
+                Field::new("account_balance", DataType::UInt8, false),
+            ])),
             0,
             Box::new(Mapper::new_and_init(HashMap::from([(1, 42), (2, 43)]))),
+            ExecutionPlanMetricsSet::new(),
         );
 
         let records = mapper
