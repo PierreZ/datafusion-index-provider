@@ -19,6 +19,7 @@
         devShells.default = with pkgs; mkShell {
           buildInputs = [
             cargo-watch
+            cargo-edit
             (
               rust-bin.stable.latest.default.override {
                 extensions = [ "rust-src" ];

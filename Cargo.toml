@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async-trait = "0.1.77"
+async-trait = "0.1.88"
 datafusion = "47.0.0"
 datafusion-common = "47.0.0"
-arrow = "55.0.0"
-futures = "0.3.26"
-futures-util = "0.3.30"
-futures-core = "0.3.30"
-log = "0.4.20"
+arrow = "55.1.0"
+futures = "0.3.31"
+futures-util = "0.3.31"
+futures-core = "0.3.31"
+log = "0.4.27"
 
 [dev-dependencies]
-tokio = { version = "1.41.0", features = ["macros", "rt-multi-thread"] }
-env_logger = "0.11.2"
+tokio = { version = "1.45.0", features = ["macros", "rt-multi-thread"] }
+env_logger = "0.11.8"
