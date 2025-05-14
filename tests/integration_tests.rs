@@ -129,3 +129,79 @@ async fn test_employee_table_filter_department_equal_and_all_ages() {
     assert_names(&results, &["Alice", "David"]);
     assert_ages(&results, &[25, 28]);
 }
+#[tokio::test]
+async fn test_explain_simple_filter() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("EXPLAIN SELECT name, age FROM employees WHERE age = 25")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+
+    // The output of EXPLAIN is a DataFrame with a schema like:
+    // arrow_schema: Schema { fields: [Field { name: "plan_type", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "plan", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }], metadata: {} }
+    // We need to concatenate the 'plan' column to get the full plan string.
+    let plan_lines: Vec<String> = results
+        .iter()
+        .flat_map(|batch| {
+            let plan_array = batch
+                .column_by_name("plan")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            plan_array
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let full_plan = plan_lines.join("\n");
+
+    println!("Query Plan:\n{}", full_plan);
+
+    assert!(
+        full_plan.contains("IndexLookupExec"),
+        "Plan should include IndexLookupExec. Actual plan:\n{}",
+        full_plan
+    );
+}
+
+#[tokio::test]
+async fn test_explain_analyze_simple_filter() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("EXPLAIN ANALYZE SELECT name, age FROM employees WHERE age = 25")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+
+    let plan_lines: Vec<String> = results
+        .iter()
+        .flat_map(|batch| {
+            let plan_array = batch
+                .column_by_name("plan")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            plan_array
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let full_plan = plan_lines.join("\n");
+
+    println!("Query Plan (Analyze):\n{}", full_plan);
+
+    assert!(
+        full_plan.contains("IndexLookupExec"),
+        "Plan should include IndexLookupExec. Actual plan:\n{}",
+        full_plan
+    );
+}
