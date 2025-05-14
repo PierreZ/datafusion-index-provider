@@ -1,13 +1,10 @@
-use arrow::array::UInt64Array;
-use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::common::Result;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,

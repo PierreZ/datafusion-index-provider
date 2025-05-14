@@ -3,14 +3,15 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch, StringArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::{Result, ScalarValue, Statistics};
 use datafusion::logical_expr::{Expr, Operator};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::SendableRecordBatchStream;
 
-use datafusion_index_provider::physical::indexes::index::{Index, ROW_ID_COLUMN_NAME};
+use datafusion_index_provider::physical::indexes::index::Index;
+use datafusion_index_provider::physical::indexes::scan::index_scan_schema;
 
 /// A simple index structure that maps department values to row indices
 #[derive(Debug, Clone)]
@@ -87,11 +88,7 @@ impl Index for DepartmentIndex {
     }
 
     fn index_schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(vec![Field::new(
-            ROW_ID_COLUMN_NAME,
-            DataType::UInt64,
-            false,
-        )]))
+        index_scan_schema(DataType::UInt64)
     }
 
     fn table_name(&self) -> &str {

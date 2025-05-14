@@ -6,9 +6,6 @@ use datafusion::physical_plan::{SendableRecordBatchStream, Statistics};
 use std::any::Any;
 use std::fmt;
 
-/// Default column name for row IDs produced by index scans.
-pub const ROW_ID_COLUMN_NAME: &str = "__row_id__";
-
 /// Represents a physical index structure that can be scanned.
 pub trait Index: fmt::Debug + Send + Sync + 'static {
     /// Returns the index as [`Any`](std::any::Any) so that it can be

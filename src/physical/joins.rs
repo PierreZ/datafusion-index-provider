@@ -2,14 +2,13 @@
 
 use std::sync::Arc;
 
+use crate::ROW_ID_COLUMN_NAME;
 use datafusion::error::Result;
 use datafusion::logical_expr::JoinType;
 use datafusion::physical_expr::expressions::Column as PhysicalColumn;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
-
-const ROW_ID_COLUMN_NAME: &str = "__row_id__";
 
 /// Attempts to join two index lookup execution plans.
 /// Chooses SortMergeJoinExec if both inputs report sorted output on the 'index' column,

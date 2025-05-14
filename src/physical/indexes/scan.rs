@@ -1,4 +1,5 @@
 use crate::physical::indexes::index::Index;
+use crate::ROW_ID_COLUMN_NAME;
 use arrow::datatypes::Field;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
@@ -14,9 +15,6 @@ use datafusion::prelude::Expr;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-
-// Make the constant private to ensure the name is controlled within this module
-const ROW_ID_COLUMN_NAME: &str = "__row_id__";
 
 /// Creates the standard schema for index scan results (a single __row_id column)
 /// with the specified data type.
