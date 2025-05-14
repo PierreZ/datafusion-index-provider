@@ -7,6 +7,7 @@ use datafusion_common::Result;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// A trait for fetching records based on index entries.
@@ -35,6 +36,8 @@ pub struct RecordFetchStream {
     baseline_metrics: BaselineMetrics,
     /// Mapper used to convert an index record entry to an Record entry
     mapper: Box<dyn RecordFetcher>,
+    // Note: We don't store the Arc<ExecutionPlanMetricsSet> here directly
+    // as BaselineMetrics already holds a reference to it.
 }
 
 impl RecordFetchStream {
@@ -42,15 +45,17 @@ impl RecordFetchStream {
     ///
     /// # Arguments
     /// * `input` - The input stream containing index entries
+    /// * `metrics` - The metrics set to record to
     /// * `partition` - The partition number for metrics tracking
     /// * `mapper` - The RecordFetcher implementation that will convert index entries to records
     pub fn new(
         input: SendableRecordBatchStream,
+        metrics: Arc<ExecutionPlanMetricsSet>, // Changed: Accept metrics
         partition: usize,
         mapper: Box<dyn RecordFetcher>,
     ) -> Self {
-        let metrics = ExecutionPlanMetricsSet::new();
-        let baseline_metrics = BaselineMetrics::new(&metrics, partition);
+        // baseline_metrics are now created using the provided metrics set
+        let baseline_metrics = BaselineMetrics::new(metrics.as_ref(), partition);
         let schema = input.schema();
         Self {
             input: Some(input),
@@ -168,14 +173,16 @@ mod tests {
     #[tokio::test]
     async fn single_index() {
         let stream = Box::pin(create_index_memory_stream(vec![1, 2]).unwrap());
+        let exec_metrics = Arc::new(ExecutionPlanMetricsSet::new()); // Create metrics for the test
 
-        let mut mapper = RecordFetchStream::new(
+        let mut record_fetch_stream = RecordFetchStream::new(
             stream,
-            0,
+            exec_metrics.clone(), // Pass the metrics
+            0,                    // partition
             Box::new(Mapper::new_and_init(HashMap::from([(1, 42), (2, 43)]))),
         );
 
-        let records = mapper
+        let records = record_fetch_stream
             .next()
             .await
             .expect("Should be allowed to poll on first try")

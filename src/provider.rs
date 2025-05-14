@@ -1,7 +1,7 @@
 use crate::physical::indexes::index::Index;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
-use datafusion::error::Result;
+use datafusion::common::Result;
 use datafusion::logical_expr::utils::expr_to_columns;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
@@ -139,7 +139,11 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     /// and then calling the `scan` method on that index.
     /// The exact implementation might vary.
     /// Placeholder: Needs implementation details based on planner interaction.
-    fn create_index_scan_exec_for_expr(&self, _expr: &Expr) -> Result<Arc<dyn ExecutionPlan>>;
+    fn create_index_scan_exec_for_expr(
+        &self,
+        _expr: &Expr,
+        _partition: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Creates an execution plan that combines multiple index lookups (if necessary)
     /// and joins the results with the base table data.
@@ -165,7 +169,7 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
             // Check if *all* columns used by the filter are indexed
             let all_columns_indexed = columns
                 .iter()
-                .all(|col| indexed_columns.contains(col.name()));
+                .all(|col| indexed_columns.contains(&col.name));
 
             // Basic logic: If all columns are indexed, mark as Inexact (index can evaluate).
             // More sophisticated logic could check if a *specific* index can handle the *entire* filter.
@@ -236,7 +240,9 @@ mod tests {
     use datafusion::datasource::TableType;
     use datafusion::error::Result;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-    use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, Statistics};
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+    use datafusion::physical_plan::SendableRecordBatchStream;
+    use datafusion::physical_plan::{ExecutionPlan, Statistics};
     use datafusion_common::Column;
     use std::any::Any;
     use std::sync::Arc;
@@ -274,6 +280,8 @@ mod tests {
             &self,
             _predicate: &Expr,
             _projection: Option<&Vec<usize>>,
+            _metrics: ExecutionPlanMetricsSet,
+            _partition: usize,
         ) -> Result<SendableRecordBatchStream> {
             unimplemented!("MockSimpleIndex::scan not needed for provider tests")
         }
@@ -368,7 +376,11 @@ mod tests {
         }
 
         // Correct signature for create_index_scan_exec_for_expr
-        fn create_index_scan_exec_for_expr(&self, _expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
+        fn create_index_scan_exec_for_expr(
+            &self,
+            _expr: &Expr,
+            _partition: usize,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
             unimplemented!("Mock create_index_scan_exec_for_expr")
         }
         // Correct signature for create_index_join
@@ -393,7 +405,7 @@ mod tests {
                     // Check if *all* columns used by the filter are indexed
                     let all_columns_indexed = columns
                         .iter()
-                        .all(|col| indexed_columns.contains(col.name()));
+                        .all(|col| indexed_columns.contains(&col.name));
 
                     // Basic logic: If all columns are indexed, mark as Inexact (index can evaluate).
                     // More sophisticated logic could check if a *specific* index can handle the *entire* filter.

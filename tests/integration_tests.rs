@@ -163,8 +163,8 @@ async fn test_explain_simple_filter() {
     println!("Query Plan:\n{}", full_plan);
 
     assert!(
-        full_plan.contains("IndexLookupExec"),
-        "Plan should include IndexLookupExec. Actual plan:\n{}",
+        full_plan.contains("IndexScanExec"),
+        "Plan should include IndexScanExec. Actual plan:\n{}",
         full_plan
     );
 }
@@ -200,8 +200,15 @@ async fn test_explain_analyze_simple_filter() {
     println!("Query Plan (Analyze):\n{}", full_plan);
 
     assert!(
-        full_plan.contains("IndexLookupExec"),
-        "Plan should include IndexLookupExec. Actual plan:\n{}",
+        full_plan.contains("IndexScanExec"),
+        "Plan should include IndexScanExec. Actual plan:\n{}",
+        full_plan
+    );
+
+    // Assert that IndexScanExec shows metrics, specifically output_rows=1 for this query
+    assert!(
+        full_plan.contains("IndexScanExec: index=age_index, table=employee, predicate=age = Int32(25), metrics=[output_rows=1"),
+        "IndexScanExec should have metrics with output_rows=1. Actual plan:\n{}",
         full_plan
     );
 }

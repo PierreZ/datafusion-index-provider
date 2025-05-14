@@ -1,7 +1,8 @@
 use arrow::datatypes::SchemaRef;
-use datafusion::error::Result;
+use datafusion::common::Result;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{SendableRecordBatchStream, Statistics};
-use datafusion::prelude::Expr;
 use std::any::Any;
 use std::fmt;
 
@@ -37,6 +38,8 @@ pub trait Index: fmt::Debug + Send + Sync + 'static {
         &self,
         predicate: &Expr,
         projection: Option<&Vec<usize>>,
+        metrics: ExecutionPlanMetricsSet,
+        partition: usize,
     ) -> Result<SendableRecordBatchStream>;
 
     /// Provides statistics for the index (e.g., cardinality)

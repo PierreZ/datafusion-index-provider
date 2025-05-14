@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::error::Result;
+use datafusion::common::{Result, ScalarValue, Statistics};
 use datafusion::logical_expr::{Expr, Operator};
 use datafusion::physical_plan::memory::MemoryStream;
-use datafusion::physical_plan::{SendableRecordBatchStream, Statistics};
-use datafusion::scalar::ScalarValue;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::SendableRecordBatchStream;
 
 use datafusion_index_provider::physical::indexes::index::{Index, ROW_ID_COLUMN_NAME};
 
@@ -108,8 +108,11 @@ impl Index for DepartmentIndex {
         &self,
         predicate: &Expr,
         _projection: Option<&Vec<usize>>,
+        metrics: ExecutionPlanMetricsSet,
+        _partition: usize,
     ) -> Result<SendableRecordBatchStream> {
         log::debug!("Scanning DepartmentIndex with predicate: {:?}", predicate);
+        let baseline_metrics = BaselineMetrics::new(&metrics, _partition);
         let schema = self.index_schema();
 
         let mut matching_ids = HashSet::new(); // Default empty
@@ -147,9 +150,14 @@ impl Index for DepartmentIndex {
 
         let row_ids: Vec<u64> = matching_ids.into_iter().collect();
         let id_array = Arc::new(UInt64Array::from(row_ids));
-        let batch = RecordBatch::try_new(schema.clone(), vec![id_array])?;
+        let output_batch = RecordBatch::try_new(schema.clone(), vec![id_array])?;
+        baseline_metrics.record_output(output_batch.num_rows());
 
-        Ok(Box::pin(MemoryStream::try_new(vec![batch], schema, None)?))
+        Ok(Box::pin(MemoryStream::try_new(
+            vec![output_batch],
+            schema,
+            None,
+        )?))
         // --- End Construct RecordBatch Stream ---
     }
 

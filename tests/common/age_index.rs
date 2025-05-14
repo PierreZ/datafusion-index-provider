@@ -5,12 +5,11 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::error::Result;
+use datafusion::common::{Result, ScalarValue, Statistics};
 use datafusion::logical_expr::{Expr, Operator};
 use datafusion::physical_plan::memory::MemoryStream;
-use datafusion::physical_plan::{SendableRecordBatchStream, Statistics};
-use datafusion::scalar::ScalarValue;
-
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_index_provider::physical::indexes::index::{Index, ROW_ID_COLUMN_NAME};
 
 /// A simple index structure that maps age values to row indices
@@ -150,16 +149,19 @@ impl Index for AgeIndex {
     // Simplified scan using helper method
     fn scan(
         &self,
-        predicate: &Expr,
+        _predicate: &Expr,
         _projection: Option<&Vec<usize>>,
+        _metrics: ExecutionPlanMetricsSet,
+        _partition: usize,
     ) -> Result<SendableRecordBatchStream> {
-        log::debug!("Scanning AgeIndex with predicate: {:?}", predicate);
+        log::debug!("Scanning AgeIndex with predicate: {:?}", _predicate);
+        let baseline_metrics = BaselineMetrics::new(&_metrics, _partition);
         let schema = self.index_schema();
 
         let mut matching_ids = HashSet::new(); // Default empty
 
         // --- Predicate Parsing ---
-        if let Expr::BinaryExpr(be) = predicate {
+        if let Expr::BinaryExpr(be) = _predicate {
             let (col_expr, op, lit_expr) = match (be.left.as_ref(), be.op, be.right.as_ref()) {
                 // Case 1: Column Op Literal
                 (Expr::Column(col), op, Expr::Literal(lit)) if col.name == "age" => (col, op, lit),
@@ -172,7 +174,7 @@ impl Index for AgeIndex {
                 _ => {
                     log::warn!(
                         "AgeIndex scan predicate structure not supported: {:?}",
-                        predicate
+                        _predicate
                     );
                     (
                         // Return dummy values to avoid further processing
@@ -203,7 +205,7 @@ impl Index for AgeIndex {
             // Log if predicate is not a simple binary expression we handle
             log::warn!(
                 "AgeIndex scan predicate is not a supported BinaryExpr: {:?}",
-                predicate
+                _predicate
             );
             // Could potentially try to evaluate more complex expressions or return all ids,
             // but for now, we return empty results if the predicate isn't simple.
@@ -222,6 +224,8 @@ impl Index for AgeIndex {
 
         // Create RecordBatch with the row IDs
         let batch = RecordBatch::try_new(schema.clone(), vec![id_array])?;
+
+        baseline_metrics.record_output(batch.num_rows());
 
         // Return stream with the single batch
         Ok(Box::pin(MemoryStream::try_new(vec![batch], schema, None)?))

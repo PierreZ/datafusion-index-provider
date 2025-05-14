@@ -1,9 +1,11 @@
 use crate::physical::indexes::index::Index;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::Field;
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::TaskContext;
+use datafusion::execution::context::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
@@ -29,10 +31,11 @@ pub fn index_scan_schema(data_type: DataType) -> SchemaRef {
 /// Physical plan node for scanning a single index based on a filter.
 #[derive(Debug)]
 pub struct IndexScanExec {
+    schema: SchemaRef,
     index: Arc<dyn Index>,
     predicate: Expr,
     properties: PlanProperties,
-    schema: SchemaRef,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IndexScanExec {
@@ -48,11 +51,14 @@ impl IndexScanExec {
         let properties =
             PlanProperties::new(eq_properties, partitioning, emission_type, boundedness);
 
+        let metrics = ExecutionPlanMetricsSet::new();
+
         Ok(Self {
+            schema,
             index,
             predicate,
             properties,
-            schema,
+            metrics,
         })
     }
 
@@ -121,11 +127,17 @@ impl ExecutionPlan for IndexScanExec {
             )));
         }
 
-        self.index.scan(&self.predicate, None)
+        // Pass the metrics and partition to the index's scan method
+        self.index
+            .scan(&self.predicate, None, self.metrics.clone(), partition)
     }
 
     fn statistics(&self) -> Result<Statistics> {
         Ok(self.index.statistics())
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
@@ -140,13 +152,52 @@ mod tests {
     use datafusion::execution::context::TaskContext;
     use datafusion::logical_expr::{col, Expr};
     use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::physical_plan::metrics::BaselineMetrics;
     use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, Statistics};
     use datafusion_common::stats::Precision;
     use datafusion_common::ScalarValue;
-    use futures::stream::TryStreamExt;
+    use futures::StreamExt;
+    use futures::TryStreamExt;
 
-    use std::any::Any;
-    use std::sync::Arc;
+    // Define the metrics reporting stream wrapper here
+    struct MockMetricsReportingStream {
+        schema: SchemaRef,
+        inner_stream: SendableRecordBatchStream, // e.g., MemoryStream, boxed
+        baseline_metrics: BaselineMetrics,
+    }
+
+    impl MockMetricsReportingStream {
+        pub fn new(
+            schema: SchemaRef,
+            inner_stream: SendableRecordBatchStream,
+            baseline_metrics: BaselineMetrics,
+        ) -> Self {
+            Self {
+                schema,
+                inner_stream,
+                baseline_metrics,
+            }
+        }
+    }
+
+    impl futures::Stream for MockMetricsReportingStream {
+        type Item = Result<RecordBatch>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let poll_result = self.inner_stream.poll_next_unpin(cx);
+            // Use record_poll from BaselineMetrics to update metrics based on stream activity
+            self.baseline_metrics.record_poll(poll_result)
+        }
+    }
+
+    impl datafusion::physical_plan::RecordBatchStream for MockMetricsReportingStream {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+    }
 
     // A mock index for testing purposes
     #[derive(Debug)]
@@ -206,6 +257,8 @@ mod tests {
             &self,
             _predicate: &Expr,
             _projection: Option<&Vec<usize>>,
+            metrics: ExecutionPlanMetricsSet, // Changed from Arc<ExecutionPlanMetricsSet>
+            partition: usize,
         ) -> Result<SendableRecordBatchStream> {
             let data = match &self.scan_result {
                 Some(Ok(batches)) => batches.clone(),
@@ -217,8 +270,15 @@ mod tests {
                 }
                 None => vec![],
             };
-            let stream = MemoryStream::try_new(data, self.schema.clone(), None)?;
-            Ok(Box::pin(stream))
+            let schema = self.schema.clone(); // Use the MockIndex's schema
+            let data_stream = MemoryStream::try_new(data, schema.clone(), None)?;
+
+            let baseline = BaselineMetrics::new(&metrics, partition);
+            // Wrap the data_stream with our metrics reporting stream
+            let reporting_stream =
+                MockMetricsReportingStream::new(schema, Box::pin(data_stream), baseline);
+
+            Ok(Box::pin(reporting_stream))
         }
 
         fn statistics(&self) -> Statistics {
