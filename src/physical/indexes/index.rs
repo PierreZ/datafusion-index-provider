@@ -1,10 +1,10 @@
 use arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::{SendableRecordBatchStream, Statistics};
+use datafusion::physical_plan::{ExecutionPlan, Statistics};
 use std::any::Any;
 use std::fmt;
+use std::sync::Arc;
 
 /// Represents a physical index structure that can be scanned.
 pub trait Index: fmt::Debug + Send + Sync + 'static {
@@ -21,6 +21,17 @@ pub trait Index: fmt::Debug + Send + Sync + 'static {
     /// Get the name of the table this index applies to
     fn table_name(&self) -> &str;
 
+    /// Indicates if the index will provide data in a specific order.
+    /// TODO: Use LexOrdering
+    fn is_ordered(&self) -> bool {
+        false
+    }
+
+    /// Optimize the provided filters.
+    fn optimize(&self, filters: &Vec<Expr>) -> Result<Vec<Expr>> {
+        Ok(filters.clone())
+    }
+
     /// Check if this index can potentially satisfy (part of) the given predicate.
     /// This is a fast check that should avoid accessing index metadata if possible.
     fn supports_predicate(&self, predicate: &Expr) -> Result<bool>;
@@ -31,13 +42,11 @@ pub trait Index: fmt::Debug + Send + Sync + 'static {
     /// If `projection` is None or empty, only the row identifier is required.
     /// If the query requires only columns available within the index itself
     /// (an "index-only scan"), this scan node might be able to return that data directly.
-    fn scan(
+    fn scan_index(
         &self,
-        predicate: &Expr,
-        projection: Option<&Vec<usize>>,
-        metrics: ExecutionPlanMetricsSet,
-        partition: usize,
-    ) -> Result<SendableRecordBatchStream>;
+        predicate: &Vec<Expr>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Provides statistics for the index (e.g., cardinality)
     /// Used by the optimizer for cost-based decisions.

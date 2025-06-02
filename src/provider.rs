@@ -1,10 +1,13 @@
 use crate::physical::indexes::index::Index;
+use crate::physical::joins::try_create_index_lookup_join;
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::catalog::TableProvider;
 use datafusion::common::Result;
 use datafusion::logical_expr::utils::expr_to_columns;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion_common::DataFusionError;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -58,87 +61,82 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     ///
     /// The default implementation identifies filters on indexed columns and attempts
     /// simple optimizations like combining range comparisons into BETWEEN clauses.
-    fn analyze_and_optimize_filters(&self, filters: &[Expr]) -> Result<(Vec<Expr>, Vec<Expr>)> {
+    fn analyze_and_optimize_filters(
+        &self,
+        filters: &[Expr],
+    ) -> Result<(Vec<(Arc<dyn Index>, Vec<Expr>)>, Vec<Expr>)> {
         let mut potential_index_filters = Vec::new();
         let mut remaining_filters = Vec::new();
+        let mut result: HashMap<String, (Arc<dyn Index>, Vec<Expr>)> = HashMap::new();
 
-        // 1. Initial pass: Identify potential candidates using the helper method
+        // Group expr by index
         for filter in filters {
-            if self.identify_index_pushdown_candidate(filter)? {
-                potential_index_filters.push(filter.clone());
-            } else {
-                remaining_filters.push(filter.clone());
+            match self.find_index_from_expr(&filter)? {
+                None => remaining_filters.push(filter.clone()),
+                Some(index) => match result.get_mut(&index.name().to_string()) {
+                    Some((_, exprs)) => exprs.push(filter.clone()),
+                    None => {
+                        result.insert(
+                            index.name().to_string(),
+                            (index.clone(), vec![filter.clone()]),
+                        );
+                    }
+                },
             }
         }
 
-        // 2. Group potential candidates by column name
-        let (column_grouped_filters, ungrouped_potential_filters) =
-            group_potential_index_filters_by_column(potential_index_filters);
-
-        // 3. Optimize each group using the helper method
-        let mut optimized_index_filters = Vec::new();
-        for (col_name, col_exprs) in column_grouped_filters {
-            let optimized_group = self.optimize_column_filters(&col_name, &col_exprs)?;
-            optimized_index_filters.extend(optimized_group);
+        // ask the index if it can optimize
+        for (_index_name, (index, exprs)) in result.iter() {
+            let optimized = index.optimize(&exprs)?;
+            potential_index_filters.push((index.clone(), optimized));
         }
 
-        // 4. Add ungrouped potential filters to optimized_index_filters directly
-        //    (They were identified as candidates but couldn't be optimized further by column)
-        optimized_index_filters.extend(ungrouped_potential_filters);
-
-        Ok((optimized_index_filters, remaining_filters))
+        Ok((potential_index_filters, remaining_filters))
     }
 
-    /// Determines if a single filter expression is potentially suitable for index pushdown.
-    ///
-    /// This is called *before* grouping or optimization. Implementers can override this
-    /// to define which basic expression shapes their indexes might support.
-    ///
-    /// Default implementation checks for BinaryExpr `Column Op Literal` where the column is indexed.
-    fn identify_index_pushdown_candidate(&self, filter: &Expr) -> Result<bool> {
-        if let Expr::BinaryExpr(binary) = filter {
-            if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
-                let indexed_columns = self.get_indexed_columns_names()?;
-                if indexed_columns.contains(&col.name) {
-                    // TODO: Could add more checks here based on the operator (binary.op)
-                    //       or the literal type if needed by default.
-                    return Ok(true);
-                }
+    /// Finds the first index that can support the given predicate.
+    fn find_index_from_expr(&self, expr: &Expr) -> Result<Option<Arc<dyn Index>>> {
+        let indexes = self.indexes()?;
+        for index in indexes {
+            if index.supports_predicate(expr)? {
+                return Ok(Some(index));
             }
-            // Could potentially add checks for other Expr types like InList, Between here.
         }
-        Ok(false)
+        Ok(None)
     }
-
-    /// Optimizes a set of filter expressions that apply to the *same* indexed column.
-    ///
-    /// This is called *after* initial candidates are identified and grouped by column.
-    /// Implementers can override this to provide custom combination logic (e.g., range -> BETWEEN).
-    ///
-    /// Default implementation returns the filters as-is.
-    fn optimize_column_filters(&self, _col_name: &str, filters: &[Expr]) -> Result<Vec<Expr>> {
-        Ok(filters.to_vec())
-    }
-
-    /// Creates an IndexLookupExec for the given filter expression.
-    /// This likely involves finding a suitable index via `find_suitable_indexes`
-    /// and then calling the `scan` method on that index.
-    /// The exact implementation might vary.
-    /// Placeholder: Needs implementation details based on planner interaction.
-    fn create_index_scan_exec_for_expr(
-        &self,
-        _expr: &Expr,
-        _partition: usize,
-    ) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Creates an execution plan that combines multiple index lookups (if necessary)
     /// and joins the results with the base table data.
     /// Default implementation might use HashJoinExec or a custom IndexJoinExec.
     fn merge_indexes_streams(
         &self,
-        _lookups: Vec<Arc<dyn ExecutionPlan>>, // Results of create_index_lookup
-        _projection: Option<&Vec<usize>>,      // Projection for the final table data
-    ) -> Result<Arc<dyn ExecutionPlan>>;
+        indexes: &Vec<(Arc<dyn Index>, Vec<Expr>)>,
+        _projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if indexes.len() == 0 {
+            return Err(DataFusionError::Internal("No indexes provided".to_string()));
+        }
+
+        if indexes.len() == 1 {
+            let (index, exprs) = &indexes[0];
+            return index.scan_index(exprs, limit);
+        }
+
+        if indexes.len() == 2 {
+            let (index1, exprs1) = &indexes[0];
+            let (index2, exprs2) = &indexes[1];
+
+            let left = index1.scan_index(exprs1, limit)?;
+            let left_ordered = index1.is_ordered();
+            let right = index2.scan_index(exprs2, limit)?;
+            let right_ordered = index2.is_ordered();
+
+            return try_create_index_lookup_join(left, left_ordered, right, right_ordered);
+        }
+
+        unimplemented!()
+    }
 
     /// Overloads the `supports_filters_pushdown` method from `TableProvider` to take advantage of indexes.
     /// It checks if filters can be handled by available indexes.
@@ -191,42 +189,26 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
             .collect() // Collect the results for each filter into a Vec.
     }
 
-    // Note: We might need more methods here in the future, for example,
-    // to provide more detailed cost information about using a specific index
-    // or to handle index-specific DDL/DML operations.
-}
+    async fn create_execution_plan_with_indexes(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let (indexes, remaining) = self.analyze_and_optimize_filters(filters)?;
 
-/// Helper function to group potential index filters by the column they reference.
-/// Filters that cannot be easily associated with a single column are returned separately.
-fn group_potential_index_filters_by_column(
-    potential_filters: Vec<Expr>,
-) -> (HashMap<String, Vec<Expr>>, Vec<Expr>) {
-    let mut column_grouped_filters: HashMap<String, Vec<Expr>> = HashMap::new();
-    let mut ungrouped_potential_filters = Vec::new();
-
-    for expr in potential_filters {
-        let mut columns = HashSet::new();
-        match expr_to_columns(&expr, &mut columns) {
-            Ok(_) if columns.len() == 1 => {
-                // If exactly one column is referenced, use its name for grouping
-                if let Some(col) = columns.iter().next() {
-                    column_grouped_filters
-                        .entry(col.name.clone())
-                        .or_default()
-                        .push(expr); // Move expr here
-                } else {
-                    // Should not happen if len is 1, but handle defensively
-                    ungrouped_potential_filters.push(expr);
-                }
-            }
-            _ => {
-                // Error converting or zero/multiple columns found
-                ungrouped_potential_filters.push(expr);
-            }
+        if !remaining.is_empty() {
+            return Err(DataFusionError::NotImplemented(
+                "Remaining filters not supported".to_string(),
+            ));
         }
+
+        // Merge the index scan plans into a single execution plan
+        self.merge_indexes_streams(&indexes, projection, limit)
     }
 
-    (column_grouped_filters, ungrouped_potential_filters)
+    // Add support for updating indexes
 }
 
 #[cfg(test)]
@@ -239,8 +221,6 @@ mod tests {
     use datafusion::datasource::TableType;
     use datafusion::error::Result;
     use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-    use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion::physical_plan::{ExecutionPlan, Statistics};
     use datafusion_common::Column;
     use std::any::Any;
@@ -275,13 +255,11 @@ mod tests {
             Ok(self.supports)
         }
 
-        fn scan(
+        fn scan_index(
             &self,
-            _predicate: &Expr,
-            _projection: Option<&Vec<usize>>,
-            _metrics: ExecutionPlanMetricsSet,
-            _partition: usize,
-        ) -> Result<SendableRecordBatchStream> {
+            _predicate: &Vec<Expr>,
+            _limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
             unimplemented!("MockSimpleIndex::scan not needed for provider tests")
         }
 
@@ -372,23 +350,6 @@ mod tests {
     impl IndexedTableProvider for MockIndexedTable {
         fn indexes(&self) -> Result<Vec<Arc<dyn Index>>> {
             Ok(self.indexes.clone())
-        }
-
-        // Correct signature for create_index_scan_exec_for_expr
-        fn create_index_scan_exec_for_expr(
-            &self,
-            _expr: &Expr,
-            _partition: usize,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            unimplemented!("Mock create_index_scan_exec_for_expr")
-        }
-        // Correct signature for create_index_join
-        fn merge_indexes_streams(
-            &self,
-            _lookups: Vec<Arc<dyn ExecutionPlan>>,
-            _projection: Option<&Vec<usize>>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            unimplemented!("Mock does not implement create_index_join")
         }
 
         fn supports_index_filters_pushdown(
