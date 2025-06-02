@@ -33,7 +33,6 @@ pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Optio
     let mut other_exprs = Vec::new();
     let mut relation_name = None;
 
-    // First extract the relation name from any of the expressions
     for expr in exprs {
         if let Expr::BinaryExpr(binary) = expr {
             if let (Expr::Column(col), _) = (&*binary.left, &*binary.right) {
@@ -51,11 +50,9 @@ pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Optio
                 if col.name == column_name {
                     match binary.op {
                         Operator::GtEq | Operator::Gt => {
-                            // Take the highest lower bound
                             let mut val = value.clone();
                             if binary.op == Operator::Gt {
                                 // For Gt, we need to increment the value
-                                // This is a basic increment implementation that could be expanded
                                 match &val {
                                     ScalarValue::Int8(Some(v)) => {
                                         val = ScalarValue::Int8(Some(v + 1))
@@ -81,7 +78,7 @@ pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Optio
                                     ScalarValue::UInt64(Some(v)) => {
                                         val = ScalarValue::UInt64(Some(v + 1))
                                     }
-                                    _ => return None, // Cannot increment this type
+                                    _ => return None,
                                 }
                             }
                             match lower_bound {
@@ -94,10 +91,8 @@ pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Optio
                             }
                         }
                         Operator::LtEq | Operator::Lt => {
-                            // Take the lowest upper bound
                             let mut val = value.clone();
                             if binary.op == Operator::Lt {
-                                // For Lt, we need to decrement the value
                                 match &val {
                                     ScalarValue::Int8(Some(v)) => {
                                         val = ScalarValue::Int8(Some(v - 1))
@@ -123,7 +118,7 @@ pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Optio
                                     ScalarValue::UInt64(Some(v)) => {
                                         val = ScalarValue::UInt64(Some(v.saturating_sub(1)))
                                     }
-                                    _ => return None, // Cannot decrement this type
+                                    _ => return None,
                                 }
                             }
                             match upper_bound {
@@ -142,11 +137,9 @@ pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Optio
         }
     }
 
-    // If we have both bounds, create the expressions
     if let (Some(low), Some(high)) = (lower_bound, upper_bound) {
         let mut optimized = other_exprs;
 
-        // Create BETWEEN low AND high
         optimized.push(Expr::Between(Between {
             negated: false,
             expr: Box::new(Expr::Column(Column {
@@ -182,7 +175,6 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], Expr::Between(_)));
 
-        // Test GTE and LTE
         let gte_expr = col(col_name).gt_eq(lit(10));
         let lte_expr = col(col_name).lt_eq(lit(20));
         let exprs = vec![&gte_expr, &lte_expr];

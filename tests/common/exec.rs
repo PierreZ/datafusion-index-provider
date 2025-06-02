@@ -144,7 +144,7 @@ impl ExecutionPlan for IndexJoinExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner()) // Expose metrics
+        Some(self.metrics.clone_inner())
     }
 
     fn name(&self) -> &str {

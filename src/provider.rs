@@ -36,7 +36,6 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         Ok(suitable_indexes)
     }
 
-    // --- Methods moved from old IndexProvider trait ---
     /// Returns a set of column names that are indexed by any of the indexes
     /// returned by `indexes()`.
     /// The default implementation iterates through all indexes and collects
@@ -99,7 +98,6 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     fn identify_index_pushdown_candidate(&self, filter: &Expr) -> Result<bool> {
         if let Expr::BinaryExpr(binary) = filter {
             if let (Expr::Column(col), Expr::Literal(_)) = (&*binary.left, &*binary.right) {
-                // Check if the column itself is indexed
                 let indexed_columns = self.get_indexed_columns_names()?;
                 if indexed_columns.contains(&col.name) {
                     // TODO: Could add more checks here based on the operator (binary.op)
@@ -117,21 +115,9 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     /// This is called *after* initial candidates are identified and grouped by column.
     /// Implementers can override this to provide custom combination logic (e.g., range -> BETWEEN).
     ///
-    /// Default implementation currently returns the filters as-is, but includes a placeholder
-    /// for combination logic like `try_combine_exprs_to_between`.
+    /// Default implementation returns the filters as-is.
     fn optimize_column_filters(&self, _col_name: &str, filters: &[Expr]) -> Result<Vec<Expr>> {
-        if filters.len() > 1 {
-            // Placeholder for combination logic
-            // let filters_refs: Vec<&Expr> = filters.iter().collect();
-            // if let Some(combined) = try_combine_exprs_to_between(filters_refs.as_slice(), _col_name) {
-            //     return Ok(combined);
-            // }
-            // Fallback: return original filters if no combination possible
-            Ok(filters.to_vec())
-            // TODO: Re-enable or implement try_combine_exprs_to_between or other optimizations
-        } else {
-            Ok(filters.to_vec())
-        }
+        Ok(filters.to_vec())
     }
 
     /// Creates an IndexLookupExec for the given filter expression.
@@ -148,7 +134,6 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     /// Creates an execution plan that combines multiple index lookups (if necessary)
     /// and joins the results with the base table data.
     /// Default implementation might use HashJoinExec or a custom IndexJoinExec.
-    /// Placeholder: Needs implementation details.
     fn merge_indexes_streams(
         &self,
         _lookups: Vec<Arc<dyn ExecutionPlan>>, // Results of create_index_lookup
@@ -161,35 +146,49 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        let mut pushdowns = Vec::with_capacity(filters.len());
-        let indexed_columns = self.get_indexed_columns_names()?;
-        for filter in filters {
-            let mut columns = HashSet::new();
-            expr_to_columns(filter, &mut columns)?;
-            // Check if *all* columns used by the filter are indexed
-            let all_columns_indexed = columns
-                .iter()
-                .all(|col| indexed_columns.contains(&col.name));
+        // Get all unique column names that have at least one index.
+        // This is done once to avoid redundant computations within the loop.
+        let indexed_column_names = self.get_indexed_columns_names()?;
 
-            // Basic logic: If all columns are indexed, mark as Inexact (index can evaluate).
-            // More sophisticated logic could check if a *specific* index can handle the *entire* filter.
-            if all_columns_indexed && !columns.is_empty() {
-                // Check if any single suitable index supports the *entire* predicate
-                let can_support = self
-                    .find_suitable_indexes(filter)?
-                    .iter()
-                    .any(|index| index.supports_predicate(filter).unwrap_or(false));
-                if can_support {
-                    pushdowns.push(TableProviderFilterPushDown::Inexact);
+        filters
+            .iter()
+            .map(|filter_expr| {
+                // Renamed 'filter' to 'filter_expr' for clarity with Expr type
+                let mut used_columns = HashSet::new();
+                // Extract all columns involved in the current filter expression.
+                expr_to_columns(filter_expr, &mut used_columns)?;
+
+                // Determine if this filter can be (at least partially) handled by an index.
+                let is_inexact_pushdown = if !used_columns.is_empty() {
+                    // Check if all columns used in the filter expression are indexed.
+                    let all_filter_columns_are_indexed = used_columns
+                        .iter()
+                        .all(|col| indexed_column_names.contains(&col.name));
+
+                    if all_filter_columns_are_indexed {
+                        // If all columns are indexed, check if any single suitable index
+                        // can fully support this filter predicate.
+                        // The `unwrap_or(false)` handles cases where `supports_predicate` itself
+                        // might return an error, treating such cases as 'not supported'.
+                        self.find_suitable_indexes(filter_expr)?
+                            .iter()
+                            .any(|index| index.supports_predicate(filter_expr).unwrap_or(false))
+                    } else {
+                        // Not all columns used by the filter are indexed.
+                        false
+                    }
                 } else {
-                    // Columns are indexed, but no single index supports the filter structure
-                    pushdowns.push(TableProviderFilterPushDown::Unsupported);
+                    // The filter expression does not involve any columns.
+                    false
+                };
+
+                if is_inexact_pushdown {
+                    Ok(TableProviderFilterPushDown::Inexact)
+                } else {
+                    Ok(TableProviderFilterPushDown::Unsupported)
                 }
-            } else {
-                pushdowns.push(TableProviderFilterPushDown::Unsupported);
-            }
-        }
-        Ok(pushdowns)
+            })
+            .collect() // Collect the results for each filter into a Vec.
     }
 
     // Note: We might need more methods here in the future, for example,

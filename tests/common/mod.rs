@@ -5,12 +5,11 @@ pub mod exec;
 pub mod record_fetcher;
 
 use arrow::array::{Int32Array, RecordBatch, StringArray};
-use std::collections::HashSet;
-// Add setup_test_env function
 use datafusion::execution::context::SessionContext;
 use employee_provider::EmployeeTableProvider;
 use env_logger;
 use log;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Helper function to setup test environment
@@ -20,11 +19,8 @@ pub async fn setup_test_env() -> SessionContext {
         .is_test(true)
         .try_init();
 
-    // Create a session context
     let ctx = SessionContext::new();
 
-    // Create and register our employee table
-    // Use Default implementation from employee_provider
     let provider = EmployeeTableProvider::default();
     ctx.register_table("employees", Arc::new(provider)).unwrap();
 
