@@ -126,7 +126,7 @@ impl DepartmentIndex {
             Expr::BinaryExpr(be) => {
                 if let Expr::Column(col_expr) = be.left.as_ref() {
                     if col_expr.name == "department" {
-                        if let Expr::Literal(scalar_val) = be.right.as_ref() {
+                        if let Expr::Literal(scalar_val, _) = be.right.as_ref() {
                             match scalar_val {
                                 ScalarValue::Utf8(Some(val_str)) => {
                                     return self.get_matching_ids(be.op, val_str);
@@ -147,7 +147,7 @@ impl DepartmentIndex {
                     if col_expr.name == "department" && !il.negated {
                         let mut combined_ids = HashSet::new();
                         for item_expr in &il.list {
-                            if let Expr::Literal(ScalarValue::Utf8(Some(val_str))) = item_expr {
+                            if let Expr::Literal(ScalarValue::Utf8(Some(val_str)), _) = item_expr {
                                 let ids_for_val = self.get_matching_ids(Operator::Eq, val_str)?;
                                 combined_ids.extend(ids_for_val);
                             } else {

@@ -46,7 +46,7 @@ pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Optio
 
     for expr in exprs {
         if let Expr::BinaryExpr(binary) = expr {
-            if let (Expr::Column(col), Expr::Literal(value)) = (&*binary.left, &*binary.right) {
+            if let (Expr::Column(col), Expr::Literal(value, _)) = (&*binary.left, &*binary.right) {
                 if col.name == column_name {
                     match binary.op {
                         Operator::GtEq | Operator::Gt => {
@@ -147,8 +147,8 @@ pub fn try_combine_exprs_to_between(exprs: &[&Expr], column_name: &str) -> Optio
                 name: column_name.to_string(),
                 spans: Spans::new(),
             })),
-            low: Box::new(Expr::Literal(low)),
-            high: Box::new(Expr::Literal(high)),
+            low: Box::new(Expr::Literal(low, None)),
+            high: Box::new(Expr::Literal(high, None)),
         }));
 
         log::debug!("Optimized expressions: {:?}", optimized);
@@ -245,7 +245,7 @@ mod tests {
         let result = try_combine_exprs_to_between(&exprs, col_name).unwrap();
         assert_eq!(result.len(), 1);
         if let Expr::Between(between) = &result[0] {
-            if let Expr::Literal(ScalarValue::Int32(Some(val))) = *between.low {
+            if let Expr::Literal(ScalarValue::Int32(Some(val)), _) = *between.low {
                 assert_eq!(val, 16); // Should take the highest lower bound (15) + 1 for GT
             } else {
                 panic!("Expected Int32 literal");
@@ -260,7 +260,7 @@ mod tests {
         let result = try_combine_exprs_to_between(&exprs, col_name).unwrap();
         assert_eq!(result.len(), 1);
         if let Expr::Between(between) = &result[0] {
-            if let Expr::Literal(ScalarValue::Int32(Some(val))) = *between.high {
+            if let Expr::Literal(ScalarValue::Int32(Some(val)), _) = *between.high {
                 assert_eq!(val, 14); // Should take the lowest upper bound (15) - 1 for LT
             } else {
                 panic!("Expected Int32 literal");

@@ -145,7 +145,7 @@ impl AgeIndex {
                                     | Operator::LtEq
                                     | Operator::Gt
                                     | Operator::GtEq => {
-                                        if let Expr::Literal(ScalarValue::Int32(Some(val))) =
+                                        if let Expr::Literal(ScalarValue::Int32(Some(val)), _) =
                                             right.as_ref()
                                         {
                                             current_expr_ids = self.get_matching_ids(*op, *val)?;
