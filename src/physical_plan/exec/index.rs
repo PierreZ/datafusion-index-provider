@@ -12,6 +12,10 @@ use datafusion::{
 use datafusion_common::DataFusionError;
 use std::sync::Arc;
 
+/// Physical plan node for scanning an [`Index`].
+///
+/// This operator scans an index with a given set of filters and an optional
+/// limit, producing a stream of row IDs that satisfy the predicates.
 #[derive(Debug)]
 pub struct IndexScanExec {
     /// The index to scan.
@@ -45,6 +49,56 @@ impl DisplayAs for IndexScanExec {
 }
 
 impl ExecutionPlan for IndexScanExec {
+    /// Return a reference to the name of this execution plan.
+    fn name(&self) -> &str {
+        "IndexScanExec"
+    }
+
+    /// Return a reference to the logical plan as [`std::any::Any`] so that it can be
+    /// downcast to a specific implementation.
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    /// Get the properties for this execution plan
+    fn properties(&self) -> &PlanProperties {
+        &self.plan_properties
+    }
+
+    /// Returns the children of this [`ExecutionPlan`].
+    /// This plan has no children.
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    /// Create a new [`ExecutionPlan`] with new children.
+    ///
+    /// This method is used to reconstruct the plan with new inputs.
+    /// This plan has no children, so it returns a clone of itself.
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Ok(self)
+    }
+
+    /// Executes this plan and returns a stream of `RecordBatch`es.
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(
+                "IndexScanExec only supports a single partition".to_string(),
+            ));
+        }
+
+        self.index.scan(&self.filters, self.limit)
+    }
+}
+
+impl IndexScanExec {
     fn name(&self) -> &str {
         "IndexScanExec"
     }
@@ -85,6 +139,7 @@ impl ExecutionPlan for IndexScanExec {
 }
 
 impl IndexScanExec {
+    /// Create a new `IndexScanExec` plan.
     pub fn try_new(
         index: Arc<dyn Index>,
         filters: Vec<Expr>,
@@ -100,7 +155,8 @@ impl IndexScanExec {
         })
     }
 
-    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    /// This function creates the `PlanProperties` object that stores the plan properties
+    /// such as schema, equivalence properties, ordering, partitioning, etc.
     fn compute_properties(schema: SchemaRef) -> PlanProperties {
         let eq_properties = EquivalenceProperties::new(schema);
 

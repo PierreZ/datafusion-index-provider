@@ -1,4 +1,4 @@
-//! Physical execution components for index joins.
+//! Physical execution plan for joining index scan results.
 
 use super::ROW_ID_COLUMN_NAME;
 use datafusion::common::Result;
@@ -8,9 +8,20 @@ use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoi
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use std::sync::Arc;
 
-/// Attempts to join two index lookup execution plans.
-/// Chooses SortMergeJoinExec if both inputs report sorted output on the 'index' column,
-/// otherwise uses HashJoinExec.
+/// Creates an appropriate join execution plan to intersect two index scan plans.
+///
+/// This function chooses the join implementation based on the properties of the
+/// input plans:
+/// - If both input plans produce results sorted on the row ID column, it creates
+///   a [`SortMergeJoinExec`] for an efficient merge join.
+/// - Otherwise, it falls back to a [`HashJoinExec`].
+///
+/// The join is always an `INNER` join, as the goal is to find the intersection
+/// of row IDs produced by the two index scans.
+///
+/// # Arguments
+/// * `left` - The left-side execution plan, which should produce row IDs.
+/// * `right` - The right-side execution plan, which should produce row IDs.
 pub fn try_create_index_lookup_join(
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 ///
 /// This trait extends the [`TableProvider`] trait with additional methods
 /// for scanning the table using indexes.
-/// The [`scan_with_indexes_or_fallback`] method is the main entry point for scanning the table
+/// The [`IndexedTableProvider::scan_with_indexes_or_fallback`] method is the main entry point for scanning the table
 /// that can be used in `TableProvider::scan`.
 #[async_trait]
 pub trait IndexedTableProvider: TableProvider + Sync + Send {
@@ -21,8 +21,16 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     fn indexes(&self) -> Result<Vec<Arc<dyn Index>>>;
 
     /// Analyzes filters, optimizes them, and groups them by the index that can handle them.
-    /// Default implementing is only using the column to find the index.
-    /// Returns a tuple of (optimized filters, remaining filters).
+    ///
+    /// # Default implementation
+    /// The default implementation groups filters by the index that supports them, based on the
+    /// column they refer to. It does not perform any optimization.
+    ///
+    /// # Returns
+    /// A tuple containing:
+    /// - A list of `IndexFilter`s, where each element is a tuple of an index and a list of
+    ///   expressions that can be handled by that index.
+    /// - A list of expressions that cannot be handled by any index.
     fn analyze_and_optimize_filters(&self, filters: &[Expr]) -> Result<(IndexFilters, Vec<Expr>)> {
         let indexes = self.indexes()?;
         let mut indexed_filters: HashMap<String, (Arc<dyn Index>, Vec<Expr>)> = HashMap::new();
@@ -52,7 +60,12 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     }
 
     /// Returns whether the filters can be pushed down to the index.
-    /// Can be used in `TableProvider::supports_filters_pushdown`.
+    /// This method can be used in `TableProvider::supports_filters_pushdown`.
+    ///
+    /// # Default implementation
+    /// The default implementation returns `TableProviderFilterPushDown::Exact` for any filter
+    /// that is supported by at least one index, and `TableProviderFilterPushDown::Unsupported`
+    /// otherwise.
     fn supports_filters_index_pushdown(
         &self,
         filters: &[&Expr],
@@ -76,9 +89,11 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         Ok(pushdown)
     }
 
-    /// Builds an ExecutionPlan to merge the results of multiple index scans.
-    /// This is the main entry point for scanning the table with indexes.
-    /// It is designed to be called by `scan_with_indexes_or_fallback`.
+    /// Builds an `ExecutionPlan` to merge the results of multiple index scans.
+    ///
+    /// This method is designed to be called by [`Self::scan_with_indexes_or_fallback`].
+    /// It is responsible for creating a physical plan that can execute scans on the given
+    /// indexes and merge the results.
     async fn scan_with_indexes(
         &self,
         state: &dyn Session,
@@ -88,9 +103,10 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         indexes: &[IndexFilter],
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
-    /// Builds an ExecutionPlan to scan the table.
-    /// This is the main entry point for scanning the table without indexes.
-    /// It is designed to be called by `scan_with_indexes_or_fallback`.
+    /// Builds an `ExecutionPlan` to scan the table.
+    ///
+    /// This method is designed to be called by [`Self::scan_with_indexes_or_fallback`].
+    /// It is responsible for creating a physical plan that can execute a full table scan.
     async fn scan_with_table(
         &self,
         state: &dyn Session,
@@ -99,10 +115,42 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
-    /// Returns an ExecutionPlan to scan the table or the indexes.
-    /// This is the main entry point for scanning the table.
-    /// It can be used in `TableProvider::scan` to route between
-    /// table scan and index scan.
+    /// Returns an `ExecutionPlan` to scan the table, using indexes if possible.
+    ///
+    /// This is the main entry point for scanning the table. It can be used in
+    /// `TableProvider::scan` to route between a table scan and an index scan.
+    ///
+    /// # Default implementation
+    /// The default implementation analyzes the filters to determine if any of them can be
+    /// handled by an index. If so, it calls [`Self::scan_with_indexes`]. Otherwise, it calls
+    /// [`Self::scan_with_table`].
+    ///
+    /// ## Execution Flow
+    ///
+    /// ```text
+    /// +--------------------------------------+
+    /// | `scan_with_indexes_or_fallback`      |
+    /// +--------------------------------------+
+    ///                  |
+    /// +--------------------------------------+
+    /// | `analyze_and_optimize_filters`       |
+    /// +--------------------------------------+
+    ///                  |                
+    ///    (index_filters, remaining_filters)
+    ///                  |                
+    /// +--------------------------------------+
+    /// | IF !index_filters.is_empty()         |
+    /// +--------------------------------------+
+    ///                  |                
+    ///     YES          |           NO
+    /// +----------------+---------------------+
+    /// |                                      |
+    /// v                                      v
+    /// +----------------+----------------+    +-----------------------------+
+    /// | `scan_with_indexes`             |    | `scan_with_table`           |
+    /// | (index_filters, remaining_filters) |    | (all_filters)               |
+    /// +---------------------------------+    +-----------------------------+
+    /// ```
     async fn scan_with_indexes_or_fallback(
         &self,
         state: &dyn Session,

@@ -24,7 +24,12 @@ use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::joins::try_create_index_lookup_join;
 use crate::types::{IndexFilter, IndexFilters};
 
-/// A physical plan to fetch records from an index.
+/// Physical plan node for fetching records from a [`RecordFetcher`] using
+/// row IDs produced by one or more index scans.
+///
+/// This operator takes one or more [`IndexFilter`]s, builds an input plan
+/// to produce row IDs (by scanning and joining index results), and then uses
+/// a [`RecordFetcher`] to retrieve the actual data for those row IDs.
 #[derive(Debug)]
 pub struct RecordFetchExec {
     indexes: Arc<IndexFilters>,
@@ -38,6 +43,7 @@ pub struct RecordFetchExec {
 }
 
 impl RecordFetchExec {
+    /// Create a new `RecordFetchExec` plan.
     pub fn try_new(
         indexes: Vec<IndexFilter>,
         limit: Option<usize>,
@@ -70,6 +76,11 @@ impl RecordFetchExec {
         })
     }
 
+    /// Build the input plan that produces the row IDs.
+    ///
+    /// If there is a single index, the input plan is an `IndexScanExec`.
+    /// If there are multiple indexes, the input plans are `IndexScanExec`s joined
+    /// together using `IndexLookupJoin`s.
     fn build_input_plan(
         indexes: Vec<IndexFilter>,
         limit: Option<usize>,
@@ -118,26 +129,33 @@ impl DisplayAs for RecordFetchExec {
 }
 
 impl ExecutionPlan for RecordFetchExec {
+    /// Return a reference to the name of this execution plan.
     fn name(&self) -> &str {
         "RecordFetchExec"
     }
 
+    /// Return a reference to the logical plan as [`Any`] so that it can be
+    /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any {
         self
     }
 
+    /// Get the schema of this execution plan
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
+    /// Get the properties for this execution plan
     fn properties(&self) -> &PlanProperties {
         &self.plan_properties
     }
 
+    /// Returns the children of this [`ExecutionPlan`].
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
 
+    /// Create a new [`ExecutionPlan`] with new children.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -158,6 +176,7 @@ impl ExecutionPlan for RecordFetchExec {
         }))
     }
 
+    /// Executes this plan and returns a stream of `RecordBatch`es.
     fn execute(
         &self,
         partition: usize,
@@ -173,11 +192,13 @@ impl ExecutionPlan for RecordFetchExec {
         )))
     }
 
+    /// Get the statistics for this execution plan.
     fn statistics(&self) -> Result<Statistics> {
         Ok(Statistics::new_unknown(&self.schema()))
     }
 }
 
+/// A stream that fetches records using row IDs from an input stream.
 pub struct RecordFetchStream {
     /// The schema of the output data.
     schema: SchemaRef,
@@ -190,6 +211,7 @@ pub struct RecordFetchStream {
 }
 
 impl RecordFetchStream {
+    /// Create a new `RecordFetchStream`.
     pub fn new(
         input: SendableRecordBatchStream,
         fetcher: Arc<dyn RecordFetcher>,
