@@ -4,12 +4,12 @@ pub mod joins;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::common::{Result, Statistics};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{utils::expr_to_columns, Expr};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion_common::DataFusionError;
 use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
 
 pub const ROW_ID_COLUMN_NAME: &str = "__row_id__";
 
@@ -64,7 +64,11 @@ pub trait Index: fmt::Debug + Send + Sync + 'static {
 
     /// Creates a physical plan that scans the index and returns row IDs.
     /// The output of this plan MUST have a schema matching `index_schema()`.
-    fn scan(&self, filters: &[Expr], limit: Option<usize>) -> Result<Arc<dyn ExecutionPlan>>;
+    fn scan(
+        &self,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError>;
 
     /// Provides statistics for the index.
     fn statistics(&self) -> Statistics;
