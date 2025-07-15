@@ -12,6 +12,7 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
@@ -21,7 +22,7 @@ use futures::stream::{Stream, StreamExt};
 use crate::physical_plan::exec::index::IndexScanExec;
 use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::joins::try_create_index_lookup_join;
-use crate::types::IndexFilters;
+use crate::types::{IndexFilter, IndexFilters};
 
 /// A physical plan to fetch records from an index.
 #[derive(Debug)]
@@ -29,17 +30,19 @@ pub struct RecordFetchExec {
     indexes: Arc<IndexFilters>,
     limit: Option<usize>,
     plan_properties: PlanProperties,
-    record_fetcher: Arc<Box<dyn RecordFetcher>>,
+    record_fetcher: Arc<dyn RecordFetcher>,
     /// The input plan that produces the row IDs.
     input: Arc<dyn ExecutionPlan>,
     metrics: ExecutionPlanMetricsSet,
+    schema: SchemaRef,
 }
 
 impl RecordFetchExec {
     pub fn try_new(
-        indexes: Arc<IndexFilters>,
+        indexes: Vec<IndexFilter>,
         limit: Option<usize>,
-        record_fetcher: Box<dyn RecordFetcher>,
+        record_fetcher: Arc<dyn RecordFetcher>,
+        schema: SchemaRef,
     ) -> Result<Self> {
         if indexes.is_empty() {
             return Err(DataFusionError::Plan(
@@ -48,25 +51,27 @@ impl RecordFetchExec {
         }
 
         let input = Self::build_input_plan(indexes.clone(), limit)?;
+        let eq_properties = EquivalenceProperties::new(schema.clone());
         let plan_properties = PlanProperties::new(
-            input.properties().equivalence_properties().clone(),
+            eq_properties,
             input.properties().output_partitioning().clone(),
             input.properties().emission_type,
             input.properties().boundedness,
         );
 
         Ok(Self {
-            indexes,
+            indexes: indexes.into(),
             limit,
             plan_properties,
-            record_fetcher: Arc::new(record_fetcher),
+            record_fetcher,
             input,
             metrics: ExecutionPlanMetricsSet::new(),
+            schema,
         })
     }
 
     fn build_input_plan(
-        indexes: Arc<IndexFilters>,
+        indexes: Vec<IndexFilter>,
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut plans = indexes
@@ -121,8 +126,8 @@ impl ExecutionPlan for RecordFetchExec {
         self
     }
 
-    fn schema(&self) -> arrow::datatypes::SchemaRef {
-        self.record_fetcher.schema()
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -149,6 +154,7 @@ impl ExecutionPlan for RecordFetchExec {
             record_fetcher: self.record_fetcher.clone(),
             input: children[0].clone(),
             metrics: self.metrics.clone(),
+            schema: self.schema.clone(),
         }))
     }
 
@@ -178,7 +184,7 @@ pub struct RecordFetchStream {
     /// The stream of row IDs to fetch.
     input: Option<SendableRecordBatchStream>,
     /// The fetcher implementation.
-    fetcher: Arc<Box<dyn RecordFetcher>>,
+    fetcher: Arc<dyn RecordFetcher>,
     /// Execution metrics.
     baseline_metrics: BaselineMetrics,
 }
@@ -186,7 +192,7 @@ pub struct RecordFetchStream {
 impl RecordFetchStream {
     pub fn new(
         input: SendableRecordBatchStream,
-        fetcher: Arc<Box<dyn RecordFetcher>>,
+        fetcher: Arc<dyn RecordFetcher>,
         baseline_metrics: BaselineMetrics,
     ) -> Self {
         let schema = fetcher.schema();
@@ -240,6 +246,7 @@ impl RecordBatchStream for RecordFetchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::physical_plan::create_index_schema;
     use crate::physical_plan::Index;
     use crate::physical_plan::ROW_ID_COLUMN_NAME;
     use arrow::array::UInt64Array;
@@ -264,11 +271,7 @@ mod tests {
     impl MockIndex {
         fn new(batches: Vec<RecordBatch>) -> Self {
             Self {
-                schema: Arc::new(Schema::new(vec![Field::new(
-                    ROW_ID_COLUMN_NAME,
-                    DataType::UInt64,
-                    false,
-                )])),
+                schema: create_index_schema(DataType::UInt64),
                 scan_called: Mutex::new(false),
                 batches,
             }
@@ -384,9 +387,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_fetch_exec_no_indexes() {
-        let indexes = Arc::new(vec![]);
-        let fetcher = Box::new(MockRecordFetcher::new());
-        let err = RecordFetchExec::try_new(indexes, None, fetcher).unwrap_err();
+        let fetcher = Arc::new(MockRecordFetcher::new());
+        let err =
+            RecordFetchExec::try_new(vec![], None, fetcher, Arc::new(Schema::empty())).unwrap_err();
         assert!(
             matches!(err, DataFusionError::Plan(ref msg) if msg == "RecordFetchExec requires at least one index"),
             "Unexpected error: {err:?}"
@@ -400,10 +403,10 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1, 3])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes: Arc<IndexFilters> = Arc::new(vec![(index.clone() as Arc<dyn Index>, vec![])]);
+        let indexes: Vec<IndexFilter> = vec![(index.clone() as Arc<dyn Index>, vec![])];
 
-        let fetcher = Box::new(MockRecordFetcher::new());
-        let exec = RecordFetchExec::try_new(indexes, None, fetcher)?;
+        let fetcher = Arc::new(MockRecordFetcher::new());
+        let exec = RecordFetchExec::try_new(indexes, None, fetcher, Arc::new(Schema::empty()))?;
 
         // The input plan should be just the IndexScanExec
         assert_eq!(exec.input.name(), "IndexScanExec");
@@ -425,13 +428,13 @@ mod tests {
         )])?;
         let index2 = Arc::new(MockIndex::new(vec![index2_batch]));
 
-        let indexes: Arc<IndexFilters> = Arc::new(vec![
+        let indexes: Vec<IndexFilter> = vec![
             (index1 as Arc<dyn Index>, vec![]),
             (index2 as Arc<dyn Index>, vec![]),
-        ]);
+        ];
 
-        let fetcher = Box::new(MockRecordFetcher::new());
-        let exec = RecordFetchExec::try_new(indexes, None, fetcher)?;
+        let fetcher = Arc::new(MockRecordFetcher::new());
+        let exec = RecordFetchExec::try_new(indexes, None, fetcher, Arc::new(Schema::empty()))?;
 
         // The input plan should be a HashJoinExec
         assert_eq!(exec.input.name(), "HashJoinExec");
@@ -452,9 +455,9 @@ mod tests {
             ));
         }
 
-        let indexes = Arc::new(indexes_vec);
-        let fetcher = Box::new(MockRecordFetcher::new());
-        let exec = RecordFetchExec::try_new(indexes, None, fetcher)?;
+        let indexes = indexes_vec;
+        let fetcher = Arc::new(MockRecordFetcher::new());
+        let exec = RecordFetchExec::try_new(indexes, None, fetcher, Arc::new(Schema::empty()))?;
 
         // The input plan should be a tree of HashJoinExecs
         assert_eq!(exec.input.name(), "HashJoinExec");
@@ -481,13 +484,13 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1, 3, 5])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes = Arc::new(vec![(index as Arc<dyn Index>, vec![])]);
+        let indexes = vec![(index as Arc<dyn Index>, vec![])];
 
-        let fetcher = Box::new(MockRecordFetcher::new().with_data());
+        let fetcher = Arc::new(MockRecordFetcher::new().with_data());
         let schema = fetcher.schema();
 
         // 2. Create exec plan
-        let exec = RecordFetchExec::try_new(indexes, None, fetcher)?;
+        let exec = RecordFetchExec::try_new(indexes, None, fetcher, schema.clone())?;
 
         // 3. Execute and collect results
         let task_ctx = Arc::new(TaskContext::default());
@@ -517,11 +520,11 @@ mod tests {
     async fn test_record_fetch_exec_execute_empty_input() -> Result<()> {
         // 1. Setup mocks with no batches
         let index = Arc::new(MockIndex::new(vec![]));
-        let indexes = Arc::new(vec![(index as Arc<dyn Index>, vec![])]);
-        let fetcher = Box::new(MockRecordFetcher::new().with_data());
+        let indexes = vec![(index as Arc<dyn Index>, vec![])];
+        let fetcher = Arc::new(MockRecordFetcher::new().with_data());
 
         // 2. Create exec plan
-        let exec = RecordFetchExec::try_new(indexes, None, fetcher)?;
+        let exec = RecordFetchExec::try_new(indexes, None, fetcher, Arc::new(Schema::empty()))?;
 
         // 3. Execute and collect results
         let task_ctx = Arc::new(TaskContext::default());
@@ -549,12 +552,12 @@ mod tests {
             Arc::new(UInt64Array::from(vec![5, 7])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![batch1, batch2]));
-        let indexes = Arc::new(vec![(index as Arc<dyn Index>, vec![])]);
-        let fetcher = Box::new(MockRecordFetcher::new().with_data());
+        let indexes = vec![(index as Arc<dyn Index>, vec![])];
+        let fetcher = Arc::new(MockRecordFetcher::new().with_data());
         let schema = fetcher.schema();
 
         // 2. Create exec plan
-        let exec = RecordFetchExec::try_new(indexes, None, fetcher)?;
+        let exec = RecordFetchExec::try_new(indexes, None, fetcher, schema.clone())?;
 
         // 3. Execute and collect results
         let task_ctx = Arc::new(TaskContext::default());
@@ -604,11 +607,11 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes = Arc::new(vec![(index as Arc<dyn Index>, vec![])]);
-        let fetcher = Box::new(ErrorFetcher);
+        let indexes = vec![(index as Arc<dyn Index>, vec![])];
+        let fetcher = Arc::new(ErrorFetcher);
 
         // 2. Create exec plan
-        let exec = RecordFetchExec::try_new(indexes, None, fetcher)?;
+        let exec = RecordFetchExec::try_new(indexes, None, fetcher, Arc::new(Schema::empty()))?;
 
         // 3. Execute and expect an error
         let task_ctx = Arc::new(TaskContext::default());

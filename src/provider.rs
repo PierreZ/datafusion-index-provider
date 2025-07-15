@@ -60,13 +60,18 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         let indexes = self.indexes()?;
         let mut pushdown = Vec::new();
         for filter in filters {
+            let mut found_index = false;
             for index in indexes.iter() {
                 if index.supports_predicate(filter)? {
                     pushdown.push(TableProviderFilterPushDown::Exact);
+                    found_index = true;
                     break;
                 }
             }
-            pushdown.push(TableProviderFilterPushDown::Unsupported);
+
+            if !found_index {
+                pushdown.push(TableProviderFilterPushDown::Unsupported);
+            }
         }
         Ok(pushdown)
     }
@@ -78,7 +83,7 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+        remaining_filters: &[Expr],
         limit: Option<usize>,
         indexes: &[IndexFilter],
     ) -> Result<Arc<dyn ExecutionPlan>>;

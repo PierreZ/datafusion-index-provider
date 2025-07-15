@@ -2,7 +2,7 @@ pub mod exec;
 pub mod fetcher;
 pub mod joins;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{Result, Statistics};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{utils::expr_to_columns, Expr};
@@ -34,6 +34,15 @@ pub fn create_plan_properties_for_row_id_scan(schema: SchemaRef, ordered: bool) 
         EmissionType::Incremental,
         Boundedness::Bounded,
     )
+}
+
+/// Creates a schema for an index with a single column of the specified data type.
+pub fn create_index_schema(data_type: DataType) -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        ROW_ID_COLUMN_NAME,
+        data_type,
+        false,
+    )]))
 }
 
 /// Represents a physical index that can be scanned to find row IDs.
