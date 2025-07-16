@@ -28,12 +28,12 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
     ///
     /// # Returns
     /// A tuple containing:
-    /// - A list of `IndexFilter`s, where each element is a tuple of an index and a list of
+    /// - A list of `IndexFilter`s, where each element is a struct containing an index and a list of
     ///   expressions that can be handled by that index.
     /// - A list of expressions that cannot be handled by any index.
     fn analyze_and_optimize_filters(&self, filters: &[Expr]) -> Result<(IndexFilters, Vec<Expr>)> {
         let indexes = self.indexes()?;
-        let mut indexed_filters: HashMap<String, (Arc<dyn Index>, Vec<Expr>)> = HashMap::new();
+        let mut indexed_filters: HashMap<String, IndexFilter> = HashMap::new();
         let mut remaining_filters = Vec::new();
 
         for filter in filters {
@@ -42,8 +42,11 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
                 if index.supports_predicate(filter)? {
                     let entry = indexed_filters
                         .entry(index.name().to_string())
-                        .or_insert_with(|| (index.clone(), Vec::new()));
-                    entry.1.push(filter.clone());
+                        .or_insert_with(|| IndexFilter {
+                            index: index.clone(),
+                            filters: Vec::new(),
+                        });
+                    entry.filters.push(filter.clone());
                     found_index_for_filter = true;
                     break;
                 }
@@ -381,10 +384,10 @@ mod tests {
             indexed.len()
         );
         assert_eq!(
-            indexed[0].1.len(),
+            indexed[0].filters.len(),
             1,
             "Expected 1 indexed filter, got {}",
-            indexed[0].1.len()
+            indexed[0].filters.len()
         );
         assert_eq!(
             remaining.len(),
@@ -412,10 +415,10 @@ mod tests {
             indexed.len()
         );
         assert_eq!(
-            indexed[0].1.len(),
+            indexed[0].filters.len(),
             1,
             "Expected 1 filter in group, got {}",
-            indexed[0].1.len()
+            indexed[0].filters.len()
         );
         assert_eq!(
             remaining.len(),
@@ -437,7 +440,7 @@ mod tests {
         let (indexed, remaining) = provider.analyze_and_optimize_filters(&filters)?;
 
         assert_eq!(indexed.len(), 1, "Expected 1 indexed filter group");
-        assert_eq!(indexed[0].1.len(), 2, "Expected 2 filters in group");
+        assert_eq!(indexed[0].filters.len(), 2, "Expected 2 filters in group");
         assert_eq!(remaining.len(), 0, "Expected 0 remaining filters");
 
         Ok(())

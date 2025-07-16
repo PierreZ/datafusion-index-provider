@@ -6,11 +6,17 @@ use datafusion::prelude::Expr;
 
 use crate::physical_plan::Index;
 
-/// A tuple representing an [`Index`] and the filter expressions that it can evaluate.
+/// Represents an [`Index`] and the filter expressions that it can evaluate.
 ///
 /// This is a key data structure used to represent the outcome of filter analysis,
 /// where a set of `Expr`s is associated with a specific index that can handle them.
-pub type IndexFilter = (Arc<dyn Index>, Vec<Expr>);
+#[derive(Debug, Clone)]
+pub struct IndexFilter {
+    /// The index that can evaluate the filters.
+    pub index: Arc<dyn Index>,
+    /// The filter expressions to be evaluated by the index.
+    pub filters: Vec<Expr>,
+}
 
 /// A list of [`IndexFilter`]s.
 ///

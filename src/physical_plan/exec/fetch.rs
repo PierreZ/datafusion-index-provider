@@ -87,12 +87,12 @@ impl RecordFetchExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut plans = indexes
             .iter()
-            .map(|(index, filters)| -> Result<Arc<dyn ExecutionPlan>> {
+            .map(|index_filter| -> Result<Arc<dyn ExecutionPlan>> {
                 Ok(Arc::new(IndexScanExec::try_new(
-                    index.clone(),
-                    filters.clone(),
+                    index_filter.index.clone(),
+                    index_filter.filters.clone(),
                     limit,
-                    index.index_schema(),
+                    index_filter.index.index_schema(),
                 )?))
             })
             .collect::<Result<Vec<Arc<dyn ExecutionPlan>>>>()?;
@@ -115,7 +115,7 @@ impl DisplayAs for RecordFetchExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let index_names: Vec<_> = self.indexes.iter().map(|(i, _)| i.name()).collect();
+                let index_names: Vec<_> = self.indexes.iter().map(|i| i.index.name()).collect();
                 write!(
                     f,
                     "RecordFetchExec: indexes=[{}], limit={:?}",
@@ -425,7 +425,10 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1, 3])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes: Vec<IndexFilter> = vec![(index.clone() as Arc<dyn Index>, vec![])];
+        let indexes: Vec<IndexFilter> = vec![IndexFilter {
+            index: index.clone() as Arc<dyn Index>,
+            filters: vec![],
+        }];
 
         let fetcher = Arc::new(MockRecordFetcher::new());
         let exec = RecordFetchExec::try_new(indexes, None, fetcher, Arc::new(Schema::empty()))?;
@@ -450,9 +453,15 @@ mod tests {
         )])?;
         let index2 = Arc::new(MockIndex::new(vec![index2_batch]));
 
-        let indexes: Vec<IndexFilter> = vec![
-            (index1 as Arc<dyn Index>, vec![]),
-            (index2 as Arc<dyn Index>, vec![]),
+        let indexes = vec![
+            IndexFilter {
+                index: index1,
+                filters: vec![],
+            },
+            IndexFilter {
+                index: index2,
+                filters: vec![],
+            },
         ];
 
         let fetcher = Arc::new(MockRecordFetcher::new());
@@ -471,10 +480,10 @@ mod tests {
                 ROW_ID_COLUMN_NAME,
                 Arc::new(UInt64Array::from(vec![i, i + 1, i + 2])) as _,
             )])?;
-            indexes_vec.push((
-                Arc::new(MockIndex::new(vec![batch])) as Arc<dyn Index>,
-                vec![],
-            ));
+            indexes_vec.push(IndexFilter {
+                index: Arc::new(MockIndex::new(vec![batch])) as Arc<dyn Index>,
+                filters: vec![],
+            });
         }
 
         let indexes = indexes_vec;
@@ -506,7 +515,10 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1, 3, 5])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes = vec![(index as Arc<dyn Index>, vec![])];
+        let indexes = vec![IndexFilter {
+            index: index.clone() as Arc<dyn Index>,
+            filters: vec![],
+        }];
 
         let fetcher = Arc::new(MockRecordFetcher::new().with_data());
         let schema = fetcher.schema();
@@ -542,7 +554,10 @@ mod tests {
     async fn test_record_fetch_exec_execute_empty_input() -> Result<()> {
         // 1. Setup mocks with no batches
         let index = Arc::new(MockIndex::new(vec![]));
-        let indexes = vec![(index as Arc<dyn Index>, vec![])];
+        let indexes = vec![IndexFilter {
+            index: index.clone() as Arc<dyn Index>,
+            filters: vec![],
+        }];
         let fetcher = Arc::new(MockRecordFetcher::new().with_data());
 
         // 2. Create exec plan
@@ -574,7 +589,10 @@ mod tests {
             Arc::new(UInt64Array::from(vec![5, 7])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![batch1, batch2]));
-        let indexes = vec![(index as Arc<dyn Index>, vec![])];
+        let indexes = vec![IndexFilter {
+            index: index.clone() as Arc<dyn Index>,
+            filters: vec![],
+        }];
         let fetcher = Arc::new(MockRecordFetcher::new().with_data());
         let schema = fetcher.schema();
 
@@ -629,7 +647,10 @@ mod tests {
             Arc::new(UInt64Array::from(vec![1])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
-        let indexes = vec![(index as Arc<dyn Index>, vec![])];
+        let indexes = vec![IndexFilter {
+            index: index.clone() as Arc<dyn Index>,
+            filters: vec![],
+        }];
         let fetcher = Arc::new(ErrorFetcher);
 
         // 2. Create exec plan
