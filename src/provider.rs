@@ -1,7 +1,10 @@
+use crate::physical_plan::exec::fetch::RecordFetchExec;
+use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::Index;
 use crate::types::{IndexFilter, IndexFilters};
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableProvider};
+use datafusion::catalog::TableProvider;
 use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
@@ -92,91 +95,35 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         Ok(pushdown)
     }
 
-    /// Builds an `ExecutionPlan` to merge the results of multiple index scans.
+    /// Creates an execution plan that scans the table using the provided indexes.
     ///
-    /// This method is designed to be called by [`Self::scan_with_indexes_or_fallback`].
-    /// It is responsible for creating a physical plan that can execute scans on the given
-    /// indexes and merge the results.
-    async fn scan_with_indexes(
+    /// # Arguments
+    /// * `indexes` - A slice of `IndexFilter` structs, each containing an index and a list of
+    ///   expressions that can be handled by that index.
+    /// * `_projection` - A slice of column indices to be projected. This is currently ignored.
+    /// * `_remaining_filters` - A slice of expressions that cannot be handled by any index.
+    /// * `limit` - An optional limit on the number of rows to return.
+    /// * `schema` - The schema of the table.
+    /// * `mapper` - A reference to a `RecordFetcher` that will be used to fetch records.
+    ///
+    /// # Returns
+    /// A `Result` containing an `Arc<dyn ExecutionPlan>` that can be used to scan the table.
+    async fn create_execution_plan_with_indexes(
         &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        remaining_filters: &[Expr],
-        limit: Option<usize>,
         indexes: &[IndexFilter],
-    ) -> Result<Arc<dyn ExecutionPlan>>;
-
-    /// Builds an `ExecutionPlan` to scan the table.
-    ///
-    /// This method is designed to be called by [`Self::scan_with_indexes_or_fallback`].
-    /// It is responsible for creating a physical plan that can execute a full table scan.
-    async fn scan_with_table(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+        // TODO: Use projection
+        _projection: Option<&Vec<usize>>,
+        _remaining_filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>>;
-
-    /// Returns an `ExecutionPlan` to scan the table, using indexes if possible.
-    ///
-    /// This is the main entry point for scanning the table. It can be used in
-    /// `TableProvider::scan` to route between a table scan and an index scan.
-    ///
-    /// # Default implementation
-    /// The default implementation analyzes the filters to determine if any of them can be
-    /// handled by an index. If so, it calls [`Self::scan_with_indexes`]. Otherwise, it calls
-    /// [`Self::scan_with_table`].
-    ///
-    /// ## Execution Flow
-    ///
-    /// ```text
-    /// +--------------------------------------+
-    /// | `scan_with_indexes_or_fallback`      |
-    /// +--------------------------------------+
-    ///                  |
-    /// +--------------------------------------+
-    /// | `analyze_and_optimize_filters`       |
-    /// +--------------------------------------+
-    ///                  |                
-    ///    (index_filters, remaining_filters)
-    ///                  |                
-    /// +--------------------------------------+
-    /// | IF !index_filters.is_empty()         |
-    /// +--------------------------------------+
-    ///                  |                
-    ///     YES          |           NO
-    /// +----------------+---------------------+
-    /// |                                      |
-    /// v                                      v
-    /// +----------------+----------------+    +-----------------------------+
-    /// | `scan_with_indexes`             |    | `scan_with_table`           |
-    /// | (index_filters, remaining_filters) |    | (all_filters)               |
-    /// +---------------------------------+    +-----------------------------+
-    /// ```
-    async fn scan_with_indexes_or_fallback(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
+        schema: SchemaRef,
+        mapper: Arc<dyn RecordFetcher>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let (indexed_filters, remaining_filters) = self.analyze_and_optimize_filters(filters)?;
-
-        if indexed_filters.is_empty() {
-            return self
-                .scan_with_table(state, projection, &remaining_filters, limit)
-                .await;
-        }
-
-        self.scan_with_indexes(
-            state,
-            projection,
-            &remaining_filters,
+        Ok(Arc::new(RecordFetchExec::try_new(
+            indexes.to_vec(),
             limit,
-            &indexed_filters,
-        )
-        .await
+            Arc::clone(&mapper),
+            schema.clone(),
+        )?))
     }
 }
 
@@ -186,13 +133,14 @@ mod tests {
     use crate::physical_plan::Index;
     use crate::physical_plan::ROW_ID_COLUMN_NAME;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::catalog::Session;
     use datafusion::common::Statistics;
     use datafusion::datasource::TableType;
     use datafusion::execution::TaskContext;
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     };
-    use datafusion::prelude::{col, lit, SessionContext};
+    use datafusion::prelude::{col, lit};
     use datafusion_common::{DataFusionError, Result};
     use std::any::Any;
 
@@ -288,25 +236,11 @@ mod tests {
     #[derive(Debug)]
     struct MockTableProvider {
         indexes: Vec<Arc<dyn Index>>,
-        scanned_with_indexes: std::sync::Mutex<bool>,
-        scanned_with_table: std::sync::Mutex<bool>,
     }
 
     impl MockTableProvider {
         fn new(indexes: Vec<Arc<dyn Index>>) -> Self {
-            Self {
-                indexes,
-                scanned_with_indexes: std::sync::Mutex::new(false),
-                scanned_with_table: std::sync::Mutex::new(false),
-            }
-        }
-
-        fn was_scanned_with_indexes(&self) -> bool {
-            *self.scanned_with_indexes.lock().unwrap()
-        }
-
-        fn was_scanned_with_table(&self) -> bool {
-            *self.scanned_with_table.lock().unwrap()
+            Self { indexes }
         }
     }
 
@@ -342,29 +276,6 @@ mod tests {
     impl IndexedTableProvider for MockTableProvider {
         fn indexes(&self) -> Result<Vec<Arc<dyn Index>>> {
             Ok(self.indexes.clone())
-        }
-
-        async fn scan_with_indexes(
-            &self,
-            _state: &dyn Session,
-            _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
-            _limit: Option<usize>,
-            _indexes: &[IndexFilter],
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            *self.scanned_with_indexes.lock().unwrap() = true;
-            Ok(Arc::new(MockExec))
-        }
-
-        async fn scan_with_table(
-            &self,
-            _state: &dyn Session,
-            _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
-            _limit: Option<usize>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            *self.scanned_with_table.lock().unwrap() = true;
-            Ok(Arc::new(MockExec))
         }
     }
 
@@ -442,44 +353,6 @@ mod tests {
         assert_eq!(indexed.len(), 1, "Expected 1 indexed filter group");
         assert_eq!(indexed[0].filters.len(), 2, "Expected 2 filters in group");
         assert_eq!(remaining.len(), 0, "Expected 0 remaining filters");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_scan_with_indexes_or_fallback_uses_index() -> Result<()> {
-        let provider = MockTableProvider::new(vec![Arc::new(MockIndex {
-            column_name: "a".into(),
-            table_name: "t".into(),
-        })]);
-        let filters = vec![col("a").eq(lit(1))];
-        let session = SessionContext::new();
-
-        let _ = provider
-            .scan_with_indexes_or_fallback(&session.state(), None, &filters, None)
-            .await?;
-
-        assert!(provider.was_scanned_with_indexes());
-        assert!(!provider.was_scanned_with_table());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_scan_with_indexes_or_fallback_uses_table_scan() -> Result<()> {
-        let provider = MockTableProvider::new(vec![Arc::new(MockIndex {
-            column_name: "a".into(),
-            table_name: "t".into(),
-        })]);
-        let filters = vec![col("b").eq(lit(2))];
-        let session = SessionContext::new();
-
-        let _ = provider
-            .scan_with_indexes_or_fallback(&session.state(), None, &filters, None)
-            .await?;
-
-        assert!(!provider.was_scanned_with_indexes());
-        assert!(provider.was_scanned_with_table());
 
         Ok(())
     }

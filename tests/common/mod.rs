@@ -5,8 +5,6 @@ pub mod record_fetcher;
 use arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::execution::context::SessionContext;
 use employee_provider::EmployeeTableProvider;
-use env_logger;
-use log;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -41,9 +39,7 @@ pub fn assert_names(results: &[RecordBatch], expected_names: &[&str]) {
     for expected_name in expected_names {
         assert!(
             names.contains(*expected_name),
-            "Name {} not found in {:?}",
-            expected_name,
-            names
+            "Name {expected_name} not found in {names:?}"
         );
     }
     assert_eq!(
@@ -73,9 +69,7 @@ pub fn assert_ages(results: &[RecordBatch], expected_ages: &[i32]) {
     for expected_age in expected_ages {
         assert!(
             ages.contains(&expected_age.to_string()),
-            "Age {} not found in {:?}",
-            expected_age,
-            ages
+            "Age {expected_age} not found in {ages:?}"
         );
     }
     assert_eq!(

@@ -99,46 +99,6 @@ impl ExecutionPlan for IndexScanExec {
 }
 
 impl IndexScanExec {
-    fn name(&self) -> &str {
-        "IndexScanExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.plan_properties
-    }
-
-    // Return an empty list since this plan does not have any children.
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream, DataFusionError> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(
-                "IndexScanExec only supports a single partition".to_string(),
-            ));
-        }
-
-        self.index.scan(&self.filters, self.limit)
-    }
-}
-
-impl IndexScanExec {
     /// Create a new `IndexScanExec` plan.
     pub fn try_new(
         index: Arc<dyn Index>,

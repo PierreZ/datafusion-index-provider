@@ -28,8 +28,7 @@ async fn test_employee_table_filter_age_equal() {
 
         let df = ctx
             .sql(&format!(
-                "SELECT name, age FROM employees WHERE age = {}",
-                age
+                "SELECT name, age FROM employees WHERE age = {age}"
             ))
             .await
             .unwrap();

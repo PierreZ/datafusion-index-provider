@@ -92,8 +92,22 @@ impl TableProvider for EmployeeTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.scan_with_indexes_or_fallback(state, projection, filters, limit)
-            .await
+        let (indexed_filters, remaining_filters) = self.analyze_and_optimize_filters(filters)?;
+
+        if indexed_filters.is_empty() {
+            return self
+                .scan_with_table(state, projection, &remaining_filters, limit)
+                .await;
+        }
+
+        self.scan_with_indexes(
+            state,
+            projection,
+            &remaining_filters,
+            limit,
+            &indexed_filters,
+        )
+        .await
     }
 
     fn supports_filters_pushdown(
@@ -109,7 +123,9 @@ impl IndexedTableProvider for EmployeeTableProvider {
     fn indexes(&self) -> Result<Vec<Arc<dyn Index + 'static>>, DataFusionError> {
         Ok(vec![self.age_index.clone()])
     }
+}
 
+impl EmployeeTableProvider {
     async fn scan_with_indexes(
         &self,
         _state: &dyn Session,

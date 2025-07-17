@@ -56,7 +56,7 @@ impl RecordFetchExec {
             ));
         }
 
-        let input = Self::build_input_plan(indexes.clone(), limit)?;
+        let input = Self::build_input_plan(&indexes, limit)?;
         let eq_properties = EquivalenceProperties::new(schema.clone());
         let plan_properties = PlanProperties::new(
             eq_properties,
@@ -82,7 +82,7 @@ impl RecordFetchExec {
     /// If there are multiple indexes, the input plans are `IndexScanExec`s joined
     /// together using `IndexLookupJoin`s.
     fn build_input_plan(
-        indexes: Vec<IndexFilter>,
+        indexes: &IndexFilters,
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut plans = indexes

@@ -47,7 +47,7 @@ impl RecordFetcher for BatchMapper {
 }
 
 fn apply_row_filter(batch: &RecordBatch, row_ids: &[usize]) -> Result<RecordBatch> {
-    log::debug!("Row ids: {:?}", row_ids);
+    log::debug!("Row ids: {row_ids:?}");
     let new_columns: Result<Vec<Arc<dyn Array>>> = batch
         .columns()
         .iter()
@@ -60,7 +60,7 @@ fn apply_row_filter(batch: &RecordBatch, row_ids: &[usize]) -> Result<RecordBatc
         })
         .collect();
 
-    log::debug!("New columns: {:?}", new_columns);
+    log::debug!("New columns: {new_columns:?}");
 
     Ok(RecordBatch::try_new(batch.schema(), new_columns?)?)
 }
