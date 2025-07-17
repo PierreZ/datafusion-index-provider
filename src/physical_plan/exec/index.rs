@@ -1,12 +1,8 @@
-use crate::physical_plan::Index;
+use crate::physical_plan::{create_plan_properties_for_row_id_scan, Index};
 use arrow::datatypes::SchemaRef;
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
-    physical_expr::EquivalenceProperties,
-    physical_plan::{
-        execution_plan::{Boundedness, EmissionType},
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    },
+    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties},
     prelude::Expr,
 };
 use datafusion_common::DataFusionError;
@@ -106,26 +102,14 @@ impl IndexScanExec {
         limit: Option<usize>,
         schema: SchemaRef,
     ) -> Result<Self, DataFusionError> {
-        let plan_properties = Self::compute_properties(schema);
+        let plan_properties =
+            create_plan_properties_for_row_id_scan(schema.clone(), index.is_ordered());
         Ok(Self {
             index,
             filters,
             limit,
             plan_properties,
         })
-    }
-
-    /// This function creates the `PlanProperties` object that stores the plan properties
-    /// such as schema, equivalence properties, ordering, partitioning, etc.
-    fn compute_properties(schema: SchemaRef) -> PlanProperties {
-        let eq_properties = EquivalenceProperties::new(schema);
-
-        PlanProperties::new(
-            eq_properties,
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        )
     }
 }
 

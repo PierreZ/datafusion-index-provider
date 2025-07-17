@@ -96,6 +96,14 @@ pub trait Index: fmt::Debug + Send + Sync + 'static {
         Ok(columns.iter().any(|col| col.name == self.column_name()))
     }
 
+    /// Returns indication if the index is ordered by the row ID.
+    ///
+    /// # Default implementation
+    /// The default implementation returns `false`.
+    fn is_ordered(&self) -> bool {
+        false
+    }
+
     /// Creates a stream of row IDs that satisfy the given filters.
     ///
     /// The output of this stream MUST have a schema matching [`Self::index_schema()`].
