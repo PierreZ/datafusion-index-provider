@@ -41,7 +41,7 @@ pub fn create_plan_properties_for_row_id_scan(schema: SchemaRef, ordered: bool) 
     }
     PlanProperties::new(
         eq_properties,
-        Partitioning::UnknownPartitioning(1),
+        Partitioning::RoundRobinBatch(1),
         EmissionType::Incremental,
         Boundedness::Bounded,
     )

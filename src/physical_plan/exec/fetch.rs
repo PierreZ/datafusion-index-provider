@@ -8,6 +8,7 @@ use datafusion::execution::context::TaskContext;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
 use futures::FutureExt;
+use log::debug;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -16,7 +17,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, RecordBatchStream,
 };
 use futures::stream::{Stream, StreamExt};
 
@@ -156,6 +157,10 @@ impl ExecutionPlan for RecordFetchExec {
         vec![&self.input]
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
     /// Create a new [`ExecutionPlan`] with new children.
     fn with_new_children(
         self: Arc<Self>,
@@ -259,84 +264,101 @@ impl Stream for RecordFetchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // This function is a state machine that cycles through the `FetchState` enum.
-        // The `loop` ensures that we immediately try to transition to the next state
-        // whenever an operation completes.
+        debug!("RecordFetchStream::poll_next");
         loop {
             let state = std::mem::replace(&mut self.state, FetchState::Error);
 
             match state {
                 FetchState::ReadingInput { mut input, fetcher } => {
+                    debug!("RecordFetchStream state: ReadingInput");
                     match input.poll_next_unpin(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
-                            // If the input batch is empty, loop to get the next one.
+                            debug!(
+                                "ReadingInput: got input batch with {} rows",
+                                batch.num_rows()
+                            );
                             if batch.num_rows() == 0 {
+                                debug!("ReadingInput: input batch is empty, continuing");
                                 self.state = FetchState::ReadingInput { input, fetcher };
                                 continue;
                             }
 
                             let fetcher_clone = fetcher.clone();
                             let fut = async move {
+                                debug!(
+                                    "Fetching: starting fetch for batch with {} rows",
+                                    batch.num_rows()
+                                );
                                 let result = fetcher_clone.fetch(batch).await;
+                                debug!("Fetching: fetch finished");
                                 result.map(|batch| (input, fetcher, batch))
                             }
                             .boxed();
 
                             self.state = FetchState::Fetching(fut);
-                            // Immediately loop to poll the new future.
                             continue;
                         }
                         Poll::Ready(Some(Err(e))) => {
+                            debug!("ReadingInput: error: {}", e);
                             self.state = FetchState::Error;
                             return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
                         }
                         Poll::Ready(None) => {
+                            debug!("ReadingInput: input stream is finished");
                             return self.baseline_metrics.record_poll(Poll::Ready(None));
                         }
                         Poll::Pending => {
+                            debug!("ReadingInput: input stream is pending");
                             self.state = FetchState::ReadingInput { input, fetcher };
                             return self.baseline_metrics.record_poll(Poll::Pending);
                         }
                     }
                 }
-                FetchState::Fetching(mut fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok((input, fetcher, batch))) => {
-                        // If the fetched batch is empty, go back to reading the input.
-                        if batch.num_rows() == 0 {
-                            self.state = FetchState::ReadingInput { input, fetcher };
+                FetchState::Fetching(mut fut) => {
+                    debug!("RecordFetchStream state: Fetching");
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready(Ok((input, fetcher, batch))) => {
+                            debug!("Fetching: got fetched batch with {} rows", batch.num_rows());
+                            if batch.num_rows() == 0 {
+                                debug!("Fetching: fetched batch is empty, continuing");
+                                self.state = FetchState::ReadingInput { input, fetcher };
+                                continue;
+                            }
+                            self.state = FetchState::Yielding {
+                                input,
+                                fetcher,
+                                batch,
+                            };
                             continue;
                         }
-                        // The fetch completed with a non-empty batch, so transition
-                        // to the `Yielding` state to return it.
-                        self.state = FetchState::Yielding {
-                            input,
-                            fetcher,
-                            batch,
-                        };
-                        continue;
+                        Poll::Ready(Err(e)) => {
+                            debug!("Fetching: error: {}", e);
+                            self.state = FetchState::Error;
+                            return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
+                        }
+                        Poll::Pending => {
+                            debug!("Fetching: fetch is pending");
+                            self.state = FetchState::Fetching(fut);
+                            return self.baseline_metrics.record_poll(Poll::Pending);
+                        }
                     }
-                    Poll::Ready(Err(e)) => {
-                        self.state = FetchState::Error;
-                        return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
-                    }
-                    Poll::Pending => {
-                        self.state = FetchState::Fetching(fut);
-                        return self.baseline_metrics.record_poll(Poll::Pending);
-                    }
-                },
+                }
                 FetchState::Yielding {
                     input,
                     fetcher,
                     batch,
                 } => {
-                    // Now that we are about to yield the batch, transition back to
-                    // `ReadingInput` so the stream is ready for the next poll.
+                    debug!(
+                        "RecordFetchStream state: Yielding batch with {} rows",
+                        batch.num_rows()
+                    );
                     self.state = FetchState::ReadingInput { input, fetcher };
                     return self
                         .baseline_metrics
                         .record_poll(Poll::Ready(Some(Ok(batch))));
                 }
                 FetchState::Error => {
+                    debug!("RecordFetchStream state: Error");
                     return self.baseline_metrics.record_poll(Poll::Ready(None));
                 }
             }
@@ -572,6 +594,56 @@ mod tests {
                 vec![Arc::new(UInt64Array::from(vec![0, 1, 2, 3, 4]))],
             )
             .expect("Failed to create RecordBatch")],
+            schema.clone(),
+            None,
+        )
+        .expect("Failed to create MemoryStream");
+
+        let fetcher = Arc::new(SlowRecordFetcher::new(vec![
+            "name_0".to_string(),
+            "name_1".to_string(),
+            "name_2".to_string(),
+            "name_3".to_string(),
+            "name_4".to_string(),
+        ]));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let baseline_metrics = BaselineMetrics::new(&metrics, 0);
+
+        let mut stream = RecordFetchStream::new(Box::pin(input_stream), fetcher, baseline_metrics);
+
+        let mut total_rows = 0;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.unwrap();
+            total_rows += batch.num_rows();
+        }
+
+        assert_eq!(total_rows, 5, "Should have fetched all 5 rows");
+    }
+
+    #[tokio::test]
+    async fn test_record_fetch_exec_slow_and_multiple() {
+        let session_ctx = SessionContext::new();
+        let _task_ctx = session_ctx.task_ctx();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            ROW_ID_COLUMN_NAME,
+            DataType::UInt64,
+            false,
+        )]));
+
+        // create a memoryStream of 5 rows
+        let input_stream = MemoryStream::try_new(
+            vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(UInt64Array::from(vec![0, 1, 2]))],
+                )
+                .expect("Failed to create RecordBatch"),
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(UInt64Array::from(vec![3, 4]))],
+                )
+                .expect("Failed to create RecordBatch"),
+            ],
             schema.clone(),
             None,
         )
