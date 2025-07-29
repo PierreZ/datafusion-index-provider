@@ -6,6 +6,7 @@ use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
 use datafusion::execution::SendableRecordBatchStream;
+use futures::future::BoxFuture;
 use futures::FutureExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -202,12 +203,39 @@ impl ExecutionPlan for RecordFetchExec {
 pub struct RecordFetchStream {
     /// The schema of the output data.
     schema: SchemaRef,
-    /// The stream of row IDs to fetch.
-    input: Option<SendableRecordBatchStream>,
-    /// The fetcher implementation.
-    fetcher: Arc<dyn RecordFetcher>,
     /// Execution metrics.
     baseline_metrics: BaselineMetrics,
+    /// The state of the stream.
+    state: FetchState,
+}
+
+/// The state of the `RecordFetchStream`.
+enum FetchState {
+    /// Reading from the input stream.
+    ReadingInput {
+        input: SendableRecordBatchStream,
+        fetcher: Arc<dyn RecordFetcher>,
+    },
+    /// Fetching a batch of records. The future returns the input stream and
+    /// fetcher so they can be reclaimed.
+    Fetching(
+        BoxFuture<
+            'static,
+            Result<(
+                SendableRecordBatchStream,
+                Arc<dyn RecordFetcher>,
+                RecordBatch,
+            )>,
+        >,
+    ),
+    /// Yielding a batch to the consumer.
+    Yielding {
+        input: SendableRecordBatchStream,
+        fetcher: Arc<dyn RecordFetcher>,
+        batch: RecordBatch,
+    },
+    /// An error occurred.
+    Error,
 }
 
 impl RecordFetchStream {
@@ -218,11 +246,11 @@ impl RecordFetchStream {
         baseline_metrics: BaselineMetrics,
     ) -> Self {
         let schema = fetcher.schema();
+        let state = FetchState::ReadingInput { input, fetcher };
         Self {
             schema,
-            input: Some(input),
-            fetcher,
             baseline_metrics,
+            state,
         }
     }
 }
@@ -231,22 +259,88 @@ impl Stream for RecordFetchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let poll = match &mut self.input {
-            // input has been cleared
-            None => Poll::Ready(None),
-            Some(input) => match input.poll_next_unpin(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-                Poll::Ready(Some(Ok(record_batch))) => {
-                    match self.fetcher.fetch(record_batch).poll_unpin(cx) {
-                        Poll::Ready(record) => Poll::Ready(Some(record)),
-                        Poll::Pending => Poll::Pending,
+        // This function is a state machine that cycles through the `FetchState` enum.
+        // The `loop` ensures that we immediately try to transition to the next state
+        // whenever an operation completes.
+        loop {
+            let state = std::mem::replace(&mut self.state, FetchState::Error);
+
+            match state {
+                FetchState::ReadingInput { mut input, fetcher } => {
+                    match input.poll_next_unpin(cx) {
+                        Poll::Ready(Some(Ok(batch))) => {
+                            // If the input batch is empty, loop to get the next one.
+                            if batch.num_rows() == 0 {
+                                self.state = FetchState::ReadingInput { input, fetcher };
+                                continue;
+                            }
+
+                            let fetcher_clone = fetcher.clone();
+                            let fut = async move {
+                                let result = fetcher_clone.fetch(batch).await;
+                                result.map(|batch| (input, fetcher, batch))
+                            }
+                            .boxed();
+
+                            self.state = FetchState::Fetching(fut);
+                            // Immediately loop to poll the new future.
+                            continue;
+                        }
+                        Poll::Ready(Some(Err(e))) => {
+                            self.state = FetchState::Error;
+                            return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
+                        }
+                        Poll::Ready(None) => {
+                            return self.baseline_metrics.record_poll(Poll::Ready(None));
+                        }
+                        Poll::Pending => {
+                            self.state = FetchState::ReadingInput { input, fetcher };
+                            return self.baseline_metrics.record_poll(Poll::Pending);
+                        }
                     }
                 }
-            },
-        };
-        self.baseline_metrics.record_poll(poll)
+                FetchState::Fetching(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok((input, fetcher, batch))) => {
+                        // If the fetched batch is empty, go back to reading the input.
+                        if batch.num_rows() == 0 {
+                            self.state = FetchState::ReadingInput { input, fetcher };
+                            continue;
+                        }
+                        // The fetch completed with a non-empty batch, so transition
+                        // to the `Yielding` state to return it.
+                        self.state = FetchState::Yielding {
+                            input,
+                            fetcher,
+                            batch,
+                        };
+                        continue;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.state = FetchState::Error;
+                        return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
+                    }
+                    Poll::Pending => {
+                        self.state = FetchState::Fetching(fut);
+                        return self.baseline_metrics.record_poll(Poll::Pending);
+                    }
+                },
+                FetchState::Yielding {
+                    input,
+                    fetcher,
+                    batch,
+                } => {
+                    // Now that we are about to yield the batch, transition back to
+                    // `ReadingInput` so the stream is ready for the next poll.
+                    self.state = FetchState::ReadingInput { input, fetcher };
+                    return self
+                        .baseline_metrics
+                        .record_poll(Poll::Ready(Some(Ok(batch))));
+                }
+                FetchState::Error => {
+                    return self.baseline_metrics.record_poll(Poll::Ready(None));
+                }
+            }
+        }
     }
 }
 
@@ -255,7 +349,7 @@ impl fmt::Debug for RecordFetchStream {
         f.debug_struct("RecordFetchStream")
             .field("schema", &self.schema)
             .field("baseline_metrics", &self.baseline_metrics)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -279,8 +373,10 @@ mod tests {
     use datafusion::logical_expr::Expr;
     use datafusion::physical_plan::joins::HashJoinExec;
     use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::prelude::SessionContext;
     use std::any::Any;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     // --- Mock Index ---
     #[derive(Debug)]
@@ -405,7 +501,214 @@ mod tests {
         }
     }
 
+    // --- Slow Record Fetcher ---
+    #[derive(Debug)]
+    struct SlowRecordFetcher {
+        schema: SchemaRef,
+        names: Vec<String>,
+    }
+
+    impl SlowRecordFetcher {
+        fn new(names: Vec<String>) -> Self {
+            Self {
+                schema: Arc::new(Schema::new(vec![
+                    Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+                    Field::new("name", DataType::Utf8, false),
+                ])),
+                names,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RecordFetcher for SlowRecordFetcher {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+
+        async fn fetch(&self, index_batch: RecordBatch) -> Result<RecordBatch> {
+            // Simulate a delay
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let row_ids = index_batch
+                .column_by_name(ROW_ID_COLUMN_NAME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+
+            // add a delay between each row
+            let mut names = Vec::with_capacity(row_ids.len());
+            for id in row_ids.values().iter() {
+                // simulate an await point
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                names.push(self.names[*id as usize].clone());
+            }
+
+            Ok(RecordBatch::try_new(
+                self.schema.clone(),
+                vec![
+                    Arc::new(row_ids.clone()),
+                    Arc::new(arrow::array::StringArray::from(names)),
+                ],
+            )?)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_record_fetch_exec_slow_input() {
+        let session_ctx = SessionContext::new();
+        let _task_ctx = session_ctx.task_ctx();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            ROW_ID_COLUMN_NAME,
+            DataType::UInt64,
+            false,
+        )]));
+
+        // create a memoryStream of 5 rows
+        let input_stream = MemoryStream::try_new(
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(UInt64Array::from(vec![0, 1, 2, 3, 4]))],
+            )
+            .expect("Failed to create RecordBatch")],
+            schema.clone(),
+            None,
+        )
+        .expect("Failed to create MemoryStream");
+
+        let fetcher = Arc::new(SlowRecordFetcher::new(vec![
+            "name_0".to_string(),
+            "name_1".to_string(),
+            "name_2".to_string(),
+            "name_3".to_string(),
+            "name_4".to_string(),
+        ]));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let baseline_metrics = BaselineMetrics::new(&metrics, 0);
+
+        let mut stream = RecordFetchStream::new(Box::pin(input_stream), fetcher, baseline_metrics);
+
+        let mut total_rows = 0;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.unwrap();
+            total_rows += batch.num_rows();
+        }
+
+        assert_eq!(total_rows, 5, "Should have fetched all 5 rows");
+    }
+
+    #[tokio::test]
+    async fn test_record_fetch_exec_multiple_recordbatch() {
+        let session_ctx = SessionContext::new();
+        let _task_ctx = session_ctx.task_ctx();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            ROW_ID_COLUMN_NAME,
+            DataType::UInt64,
+            false,
+        )]));
+
+        // create a memoryStream of 5 recordBatch
+        let input_stream = MemoryStream::try_new(
+            vec![
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(vec![0]))])
+                    .expect("Failed to create RecordBatch"),
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(vec![1]))])
+                    .expect("Failed to create RecordBatch"),
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(vec![2]))])
+                    .expect("Failed to create RecordBatch"),
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(vec![3]))])
+                    .expect("Failed to create RecordBatch"),
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(vec![4]))])
+                    .expect("Failed to create RecordBatch"),
+            ],
+            schema.clone(),
+            None,
+        )
+        .expect("Failed to create MemoryStream");
+
+        let fetcher = Arc::new(SlowRecordFetcher::new(vec![
+            "name_0".to_string(),
+            "name_1".to_string(),
+            "name_2".to_string(),
+            "name_3".to_string(),
+            "name_4".to_string(),
+        ]));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let baseline_metrics = BaselineMetrics::new(&metrics, 0);
+
+        let mut stream = RecordFetchStream::new(Box::pin(input_stream), fetcher, baseline_metrics);
+
+        let mut total_rows = 0;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.unwrap();
+            total_rows += batch.num_rows();
+        }
+
+        assert_eq!(total_rows, 5, "Should have fetched all 5 rows");
+    }
+
     // --- Tests ---
+
+    #[tokio::test]
+    async fn test_record_fetch_stream_eager_with_empty_batches() -> Result<()> {
+        // This test ensures that the stream is "eager" and will skip over empty
+        // input batches to find the next valid one within a single poll cycle.
+
+        // 1. Setup input stream with an empty batch in the middle
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            ROW_ID_COLUMN_NAME,
+            DataType::UInt64,
+            false,
+        )]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![1, 2]))],
+        )?;
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![3, 4]))],
+        )?;
+        let input_stream = MemoryStream::try_new(vec![batch1, empty_batch, batch2], schema, None)?;
+
+        // 2. Setup fetcher and stream
+        let names = (0..5).map(|i| format!("name_{}", i)).collect();
+        let fetcher = Arc::new(SlowRecordFetcher::new(names));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let baseline_metrics = BaselineMetrics::new(&metrics, 0);
+        let stream =
+            RecordFetchStream::new(Box::pin(input_stream), fetcher.clone(), baseline_metrics);
+
+        // 3. Collect results
+        let results = datafusion::physical_plan::common::collect(Box::pin(stream)).await?;
+
+        // 4. Assert results
+        let expected_batch1 = RecordBatch::try_new(
+            fetcher.schema(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["name_1", "name_2"])),
+            ],
+        )?;
+        let expected_batch2 = RecordBatch::try_new(
+            fetcher.schema(),
+            vec![
+                Arc::new(UInt64Array::from(vec![3, 4])),
+                Arc::new(arrow::array::StringArray::from(vec!["name_3", "name_4"])),
+            ],
+        )?;
+
+        assert_eq!(
+            results.len(),
+            2,
+            "Should have produced two non-empty batches"
+        );
+        assert_eq!(results[0], expected_batch1);
+        assert_eq!(results[1], expected_batch2);
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_record_fetch_exec_no_indexes() {
