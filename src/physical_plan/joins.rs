@@ -6,6 +6,7 @@ use datafusion::logical_expr::JoinType;
 use datafusion::physical_expr::expressions::Column as PhysicalColumn;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
+use datafusion_common::NullEquality;
 use std::sync::Arc;
 
 /// Creates an appropriate join execution plan to intersect two index scan plans.
@@ -54,7 +55,7 @@ pub fn try_create_index_lookup_join(
             None,            // filter: Option<JoinFilter>
             JoinType::Inner, // Use Inner join for intersection
             sort_options,
-            false,
+            NullEquality::NullEqualsNull,
         )?))
     } else {
         // Use HashJoinExec
@@ -66,7 +67,7 @@ pub fn try_create_index_lookup_join(
             &JoinType::Inner,
             None, // projection: Option<Vec<usize>>
             PartitionMode::CollectLeft,
-            false, // null_equals_null: bool
+            NullEquality::NullEqualsNull,
         )?))
     }
 }

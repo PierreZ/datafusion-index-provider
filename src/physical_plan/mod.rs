@@ -20,7 +20,7 @@ use std::fmt;
 /// This column is used to join the results of an index scan with the base table.
 pub const ROW_ID_COLUMN_NAME: &str = "__row_id__";
 
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::expressions::Column as PhysicalColumn;
 use datafusion::physical_plan::{Partitioning, PlanProperties};
@@ -34,10 +34,10 @@ use std::sync::Arc;
 pub fn create_plan_properties_for_row_id_scan(schema: SchemaRef, ordered: bool) -> PlanProperties {
     let mut eq_properties = EquivalenceProperties::new(schema);
     if ordered {
-        eq_properties.add_new_ordering(LexOrdering::new(vec![PhysicalSortExpr::new_default(
-            Arc::new(PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0)),
-        )
-        .asc()]));
+        eq_properties.add_ordering(vec![PhysicalSortExpr::new_default(Arc::new(
+            PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0),
+        ))
+        .asc()]);
     }
     PlanProperties::new(
         eq_properties,
