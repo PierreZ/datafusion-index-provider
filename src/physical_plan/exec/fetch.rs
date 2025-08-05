@@ -214,6 +214,17 @@ pub struct RecordFetchStream {
     state: FetchState,
 }
 
+/// A future that resolves to a fetched `RecordBatch` and the reclaimed
+/// input stream and fetcher.
+type FetchFuture = BoxFuture<
+    'static,
+    Result<(
+        SendableRecordBatchStream,
+        Arc<dyn RecordFetcher>,
+        RecordBatch,
+    )>,
+>;
+
 /// The state of the `RecordFetchStream`.
 enum FetchState {
     /// Reading from the input stream.
@@ -223,16 +234,7 @@ enum FetchState {
     },
     /// Fetching a batch of records. The future returns the input stream and
     /// fetcher so they can be reclaimed.
-    Fetching(
-        BoxFuture<
-            'static,
-            Result<(
-                SendableRecordBatchStream,
-                Arc<dyn RecordFetcher>,
-                RecordBatch,
-            )>,
-        >,
-    ),
+    Fetching(FetchFuture),
     /// Yielding a batch to the consumer.
     Yielding {
         input: SendableRecordBatchStream,
@@ -299,7 +301,7 @@ impl Stream for RecordFetchStream {
                             continue;
                         }
                         Poll::Ready(Some(Err(e))) => {
-                            debug!("ReadingInput: error: {}", e);
+                            debug!("ReadingInput: error: {e}");
                             self.state = FetchState::Error;
                             return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
                         }
@@ -332,7 +334,7 @@ impl Stream for RecordFetchStream {
                             continue;
                         }
                         Poll::Ready(Err(e)) => {
-                            debug!("Fetching: error: {}", e);
+                            debug!("Fetching: error: {e}");
                             self.state = FetchState::Error;
                             return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
                         }
