@@ -12,10 +12,23 @@ use datafusion::physical_plan::{
 };
 use std::sync::Arc;
 
-/// Physical plan node for scanning an [`Index`].
+/// Physical execution plan for scanning an index to produce row IDs.
 ///
-/// This operator scans an index with a given set of filters and an optional
-/// limit, producing a stream of row IDs that satisfy the predicates.
+/// This operator represents the index phase of the two-phase execution model. It scans
+/// a single index with provided filter expressions and produces a stream of row IDs
+/// that satisfy the predicates. The output is then used by downstream operators like
+/// `RecordFetchExec` to retrieve complete records.
+///
+/// ## Execution Characteristics
+/// - **Single partition**: Always produces exactly one partition for correctness
+/// - **Streaming**: Results are emitted incrementally as they are discovered
+/// - **Bounded**: Execution completes when all matching row IDs are produced
+/// - **Ordering**: Preserves index ordering if the underlying index reports `is_ordered()`
+///
+/// ## Performance Considerations
+/// - Filter selectivity directly impacts downstream performance
+/// - Limit pushdown reduces unnecessary index scanning and memory usage
+/// - Ordered indexes enable optimized downstream joins via SortMergeJoin
 #[derive(Debug)]
 pub struct IndexScanExec {
     /// The index to scan.
@@ -102,7 +115,18 @@ impl ExecutionPlan for IndexScanExec {
 }
 
 impl IndexScanExec {
-    /// Create a new `IndexScanExec` plan.
+    /// Creates a new `IndexScanExec` execution plan.
+    ///
+    /// # Arguments
+    /// * `index` - The index to scan for row IDs
+    /// * `filters` - Filter expressions to apply during the scan
+    /// * `limit` - Optional limit on number of row IDs to return
+    /// * `schema` - Schema of the index output (must contain `__row_id__` column)
+    ///
+    /// # Returns
+    /// A configured `IndexScanExec` that will scan the index with the specified parameters.
+    /// The execution plan will automatically detect if the index produces ordered results
+    /// and configure appropriate output ordering properties for downstream optimization.
     pub fn try_new(
         index: Arc<dyn Index>,
         filters: Vec<Expr>,

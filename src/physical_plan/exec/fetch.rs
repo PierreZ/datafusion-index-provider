@@ -99,11 +99,76 @@ impl RecordFetchExec {
         })
     }
 
-    /// Build the input plan that produces the row IDs.
+    /// Builds the input execution plan that produces row IDs based on the IndexFilter structure.
     ///
-    /// If there is a single index, the input plan is an `IndexScanExec`.
-    /// If there are multiple indexes, the input plans are `IndexScanExec`s joined
-    /// together using `IndexLookupJoin`s.
+    /// This method is the core of the index-based execution plan generation. It recursively
+    /// processes the [`IndexFilter`] tree to create an optimized physical plan that efficiently
+    /// produces row IDs matching the query filters.
+    ///
+    /// # Plan Generation Strategy
+    ///
+    /// The method generates different execution plans based on the [`IndexFilter`] variant:
+    ///
+    /// ## [`IndexFilter::Single`] - Direct Index Scan
+    /// Creates a single [`IndexScanExec`] that directly scans the specified index with the given filter.
+    /// This is the most efficient case with minimal overhead.
+    ///
+    /// ```text
+    /// IndexScanExec(index, filter)
+    /// ```
+    ///
+    /// ## [`IndexFilter::And`] - Index Intersection via Joins  
+    /// Builds a left-deep tree of [`IndexLookupJoin`]s to intersect row IDs from multiple indexes.
+    /// The joins are performed on the `row_id` column to find rows that satisfy ALL conditions.
+    ///
+    /// ```text
+    /// IndexLookupJoin(
+    ///   IndexLookupJoin(
+    ///     IndexScanExec(index1, filter1),
+    ///     IndexScanExec(index2, filter2)
+    ///   ),
+    ///   IndexScanExec(index3, filter3)
+    /// )
+    /// ```
+    ///
+    /// This approach:
+    /// - Processes filters left-to-right, building joins incrementally
+    /// - Each join reduces the result set, making subsequent joins more efficient
+    /// - Preserves only row IDs that appear in ALL index scans
+    ///
+    /// ## [`IndexFilter::Or`] - Union with Deduplication
+    /// Creates a [`UnionExec`] of all index scans followed by an [`AggregateExec`] that groups by
+    /// `row_id` to automatically deduplicate overlapping results.
+    ///
+    /// ```text
+    /// AggregateExec(GROUP BY row_id,
+    ///   UnionExec(
+    ///     IndexScanExec(index1, filter1),
+    ///     IndexScanExec(index2, filter2),
+    ///     IndexScanExec(index3, filter3)
+    ///   )
+    /// )
+    /// ```
+    ///
+    /// This approach:
+    /// - Combines results from multiple indexes that satisfy ANY of the conditions
+    /// - Automatically deduplicates row IDs that appear in multiple index results
+    /// - Ensures each row is fetched only once in the subsequent fetch phase
+    /// - Handles empty filter lists by returning an empty execution plan
+    ///
+    /// # Arguments
+    /// * `index_filter` - The [`IndexFilter`] tree specifying which indexes to scan and how to combine them
+    /// * `limit` - Optional limit on the number of rows to return, passed through to individual index scans
+    ///
+    /// # Returns
+    /// An [`Arc<dyn ExecutionPlan>`] that produces a stream of row IDs matching the filter criteria.
+    /// The output schema always contains a single column named [`ROW_ID_COLUMN_NAME`].
+    ///
+    /// # Errors
+    /// Returns [`DataFusionError::Plan`] if:
+    /// - An [`IndexFilter::And`] contains no sub-filters
+    /// - Any recursive call to build sub-plans fails
+    /// - Index scan creation fails due to invalid filter expressions
     fn build_scan_exec(
         index_filter: &IndexFilter,
         limit: Option<usize>,

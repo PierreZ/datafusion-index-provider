@@ -1,72 +1,142 @@
 //! # DataFusion Index Provider
 //!
-//! This crate provides traits and building blocks to add index-based scanning
-//! capabilities to DataFusion [`datafusion::datasource::TableProvider`]s.
+//! This crate provides a comprehensive framework for adding index-based scanning capabilities
+//! to DataFusion [`datafusion::datasource::TableProvider`]s. It enables efficient query execution
+//! by leveraging secondary indexes to reduce I/O and improve query performance through a
+//! sophisticated two-phase execution model.
 //!
-//! ## Core Concepts
+//! ## Architecture Overview
 //!
-//! The core of this library is the [`provider::IndexedTableProvider`] trait. It extends the
-//! DataFusion [`datafusion::datasource::TableProvider`] trait with methods for discovering and scanning indexes.
+//! The crate implements a two-phase execution model:
 //!
-//! To add index support to a data source, you need to:
+//! 1. **Index Phase**: Scan one or more indexes to identify row IDs matching the query filters
+//! 2. **Fetch Phase**: Use the row IDs to fetch complete records from the underlying storage
 //!
-//! 1.  **Implement the [`physical_plan::Index`] trait:** This trait represents an index on a specific
-//!     column. It is responsible for providing its schema, checking if it can evaluate a
-//!     filter expression, and, most importantly, performing an index scan to return a
-//!     stream of row IDs.
+//! This approach is particularly effective for selective queries where indexes can significantly
+//! reduce the number of rows that need to be fetched from primary storage.
 //!
-//! 2.  **Implement the [`provider::IndexedTableProvider`] trait:** This trait is implemented on your
-//!     `TableProvider`. It is responsible for exposing the available indexes and providing
-//!     physical plans for scanning both the indexes and the base table data.
+//! ## Core Components
 //!
-//! ## Usage
+//! ### Index Management
+//! - [`physical_plan::Index`]: Trait representing a physical index that can be scanned to retrieve row IDs
+//! - [`provider::IndexedTableProvider`]: Extension of DataFusion's `TableProvider` with index discovery
+//! - [`types::IndexFilter`]: Enum representing filter operations that can be pushed down to indexes
 //!
-//! By implementing these traits, you can leverage the default implementation of
-//! [`provider::IndexedTableProvider::scan_with_indexes_or_fallback`], which automatically
-//! analyzes filters, routes queries to the appropriate indexes, and combines the results.
-//! This method can be called from your `TableProvider::scan` implementation to enable
-//! index-based query execution.
+//! ### Execution Engine  
+//! - [`physical_plan::exec::fetch::RecordFetchExec`]: Top-level execution plan orchestrating the two phases
+//! - [`physical_plan::exec::index::IndexScanExec`]: Execution plan for scanning a single index
+//! - [`physical_plan::fetcher::RecordFetcher`]: Trait for fetching complete records using row IDs
 //!
-//! 3. Use the default implementation of `IndexedTableProvider::scan_with_indexes_or_fallback`
-//!    in your `TableProvider::scan` implementation to enable index-based scanning.
+//! ## Query Capabilities
 //!
-//! ## Execution Plans
+//! The system's query capabilities are defined by the trait implementations:
 //!
-//! This crate builds physical execution plans that leverage indexes to accelerate
-//! queries. Depending on the filters, one of the following plans is typically constructed:
+//! ### Index Trait Capabilities
+//! Each [`physical_plan::Index`] implementation defines its query capabilities through:
 //!
-//! ### Single Index Scan
+//! - **`supports_predicate(&self, predicate: &Expr) -> Result<bool>`**: Determines if the index can handle a specific predicate
+//! - **Default implementation**: Supports any predicate that references the index's column name
+//! - **Custom implementations**: Can implement sophisticated predicate analysis for complex index types
 //!
-//! For a query with a filter on a single indexed column (e.g., `WHERE col_a = 10`):
+//! ### IndexedTableProvider Filter Analysis
+//! The [`provider::IndexedTableProvider`] trait provides comprehensive filter analysis through
+//! `build_index_filter()`:
+//!
+//! #### Supported Expression Types
+//! - **Simple predicates**: Any expression that an index's `supports_predicate()` method accepts
+//! - **AND operations**: `Expr::BinaryExpr` with `Operator::And` - creates `IndexFilter::And`
+//! - **OR operations**: `Expr::BinaryExpr` with `Operator::Or` - creates `IndexFilter::Or`
+//! - **Nested expressions**: Recursive traversal supports arbitrarily nested AND/OR combinations
+//!
+//! #### Filter Processing Rules
+//! 1. **Recursive traversal**: Expressions are recursively analyzed to build [`types::IndexFilter`] trees
+//! 2. **All-or-nothing**: If any part of an AND/OR expression cannot be indexed, the entire expression is rejected
+//! 3. **Index matching**: Each leaf predicate must match exactly one index via `supports_predicate()`
+//! 4. **Automatic grouping**: Multiple root-level indexable filters are automatically wrapped in `IndexFilter::And`
+//!
+//! ### Supported Query Patterns
+//!
+//! Based on the trait design, the system supports:
+//!
+//! #### Basic Index Predicates
+//! - Any predicate supported by the index implementation
+//! - Equality conditions: `indexed_column = 'value'`
+//! - Inequality conditions: `indexed_column > 100`
+//! - Range queries: `indexed_column BETWEEN 10 AND 50`
+//!
+//! #### Logical Combinations
+//! - AND across different indexes: `col_a = 1 AND col_b = 2`
+//! - OR across different indexes: `col_a = 1 OR col_b = 2`
+//! - Complex nested combinations: `(col_a = 1 AND col_b = 2) OR (col_a = 3 AND col_b = 4)`
+//!
+//! #### Multi-level Nesting
+//! - Arbitrarily deep nesting supported: `((col_a = 1 OR col_a = 2) AND col_b = 3) OR (col_c = 4 AND col_d = 5)`
+//!
+//! ## Execution Plan Generation
+//!
+//! The [`physical_plan::exec::fetch::RecordFetchExec`] generates
+//! optimized execution plans based on the [`types::IndexFilter`] structure:
+//!
+//! ### IndexFilter::Single - Direct Index Scan
+//!
+//! For simple conditions on a single indexed column:
 //! ```text
-//! +-------------------+
-//! | RecordFetchExec   |
-//! +-------------------+
-//!           |
-//! +-------------------+
-//! | IndexScanExec     |
-//! | (index_on_col_a)  |
-//! +-------------------+
+//! RecordFetchExec
+//! └── IndexScanExec (target_index)
 //! ```
 //!
-//! ### Multiple Index Scans
+//! ### IndexFilter::And - Index Intersection
 //!
-//! For a query with filters on multiple indexed columns (e.g., `WHERE col_a = 10 AND col_b > 20`):
+//! For conjunctive conditions across multiple indexes, the system builds a left-deep tree
+//! of `IndexLookupJoin`s to intersect row IDs:
 //! ```text
-//! +-------------------+
-//! | RecordFetchExec   |
-//! +-------------------+
-//!           |
-//! +-------------------+
-//! | JoinExec          |  (INNER on row_id)
-//! +-------------------+
-//!       /       \
-//!      /         \
-//! +-------------------+   +-------------------+
-//! | IndexScanExec     |   | IndexScanExec     |
-//! | (index_on_col_a)  |   | (index_on_col_b)  |
-//! +-------------------+   +-------------------+
+//! RecordFetchExec
+//! └── IndexLookupJoin (INNER on row_id)
+//!     ├── IndexLookupJoin (INNER on row_id)
+//!     │   ├── IndexScanExec (col_a_index)
+//!     │   └── IndexScanExec (col_b_index)
+//!     └── IndexScanExec (col_c_index)
 //! ```
+//!
+//! ### IndexFilter::Or - Union with Deduplication
+//!
+//! For disjunctive conditions, the system uses `UnionExec` followed by `AggregateExec`
+//! for automatic row ID deduplication:
+//! ```text
+//! RecordFetchExec
+//! └── AggregateExec (GROUP BY row_id)
+//!     └── UnionExec
+//!         ├── IndexScanExec (col_a)
+//!         ├── IndexScanExec (col_b)
+//!         └── IndexScanExec (col_c)
+//! ```
+//!
+//! This approach ensures that overlapping results from different indexes are automatically
+//! deduplicated before record fetching.
+//!
+//! ## Implementation Guide
+//!
+//! - **Implement the Index Trait**: Create indexes that can scan and return row IDs
+//! - **Implement the RecordFetcher Trait**: Define how to fetch complete records using row IDs
+//! - **Implement IndexedTableProvider**: Expose available indexes and filter analysis capabilities
+//! - **Update TableProvider Implementation**: Integrate index-based execution into your scan method
+//!
+//! ## Performance Characteristics
+//!
+//! ### Execution Plan Efficiency
+//! - **Single index**: Direct scan with minimal overhead
+//! - **AND operations**: Intersection cost scales with number of indexes and intermediate result sizes
+//! - **OR operations**: Union cost includes deduplication overhead but prevents duplicate fetches
+//!
+//! ### Memory Usage
+//! - **Index results**: Streamed through execution pipeline to minimize memory footprint
+//! - **Join operations**: Hash joins require memory proportional to smaller index result set
+//! - **Deduplication**: OR operations require memory to store unique row IDs during aggregation
+//!
+//! ### Bounded Execution
+//! - **Single partition requirement**: [`physical_plan::exec::fetch::RecordFetchExec`] requires single partition input for correct result merging
+//! - **Incremental emission**: Results are emitted incrementally as they become available
+//! - **Bounded memory**: Execution is bounded with predictable memory usage patterns
 
 pub mod physical_plan;
 pub mod provider;

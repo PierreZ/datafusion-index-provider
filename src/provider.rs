@@ -14,8 +14,9 @@ use std::sync::Arc;
 ///
 /// This trait extends the [`TableProvider`] trait with additional methods
 /// for scanning the table using indexes.
-/// The [`IndexedTableProvider::scan_with_indexes_or_fallback`] method is the main entry point for scanning the table
-/// that can be used in `TableProvider::scan`.
+/// The [`IndexedTableProvider::analyze_and_optimize_filters`] and
+/// [`IndexedTableProvider::create_execution_plan_with_indexes`] methods provide the main functionality
+/// that can be used in your `TableProvider::scan` implementation.
 #[async_trait]
 pub trait IndexedTableProvider: TableProvider + Sync + Send {
     /// Returns a list of all indexes available for this table.

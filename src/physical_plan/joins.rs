@@ -1,4 +1,9 @@
-//! Physical execution plan for joining index scan results.
+//! Physical execution plans for joining index scan results in AND operations.
+//!
+//! This module provides functionality to create optimized join execution plans that
+//! intersect row IDs from multiple index scans. The joins are used to implement
+//! AND conditions across multiple indexed columns by finding the intersection of
+//! row IDs that satisfy all individual predicates.
 
 use super::ROW_ID_COLUMN_NAME;
 use datafusion::common::Result;
@@ -9,20 +14,35 @@ use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion_common::NullEquality;
 use std::sync::Arc;
 
-/// Creates an appropriate join execution plan to intersect two index scan plans.
+/// Creates an optimized join execution plan to intersect row IDs from two index scans.
 ///
-/// This function chooses the join implementation based on the properties of the
-/// input plans:
-/// - If both input plans produce results sorted on the row ID column, it creates
-///   a [`SortMergeJoinExec`] for an efficient merge join.
-/// - Otherwise, it falls back to a [`HashJoinExec`].
+/// This function automatically selects the most efficient join algorithm based on the
+/// ordering properties of the input execution plans:
 ///
-/// The join is always an `INNER` join, as the goal is to find the intersection
-/// of row IDs produced by the two index scans.
+/// ## Join Algorithm Selection
+/// - **SortMergeJoin**: Used when both inputs are ordered by row ID, providing O(n+m) complexity
+/// - **HashJoin**: Used when inputs are unordered, providing O(n+m) average complexity with O(n) space
+///
+/// ## Performance Characteristics
+/// - **SortMergeJoin**: Memory-efficient streaming join, ideal for large ordered datasets
+/// - **HashJoin**: Builds hash table from left input, efficient for smaller left side
+///
+/// The join is always an INNER join since the goal is to find row IDs that satisfy
+/// ALL conditions (intersection semantics for AND operations).
 ///
 /// # Arguments
-/// * `left` - The left-side execution plan, which should produce row IDs.
-/// * `right` - The right-side execution plan, which should produce row IDs.
+/// * `left` - Left execution plan producing row IDs (typically becomes hash table in HashJoin)
+/// * `right` - Right execution plan producing row IDs
+///
+/// # Returns
+/// An execution plan that produces row IDs present in both inputs, maintaining the
+/// row ID schema with a single `__row_id__` column.
+///
+/// # Performance Tips
+/// For optimal performance:
+/// - Place the more selective index scan on the left side for HashJoin
+/// - Ensure row ID columns are properly typed and indexed
+/// - Consider the memory vs. CPU trade-offs between join algorithms
 pub fn try_create_index_lookup_join(
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
