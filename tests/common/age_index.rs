@@ -50,28 +50,28 @@ impl AgeIndex {
                                     }
                                 }
                                 Operator::Gt => {
-                                    for (_, ids) in self.index.range(v + 1..) {
+                                    for (_, ids) in self.index.range((v + 1)..) {
                                         for id in ids {
                                             row_ids.insert(*id);
                                         }
                                     }
                                 }
                                 Operator::GtEq => {
-                                    for (_, ids) in self.index.range(*v..) {
+                                    for (_, ids) in self.index.range(v..) {
                                         for id in ids {
                                             row_ids.insert(*id);
                                         }
                                     }
                                 }
                                 Operator::Lt => {
-                                    for (_, ids) in self.index.range(..*v) {
+                                    for (_, ids) in self.index.range(..v) {
                                         for id in ids {
                                             row_ids.insert(*id);
                                         }
                                     }
                                 }
                                 Operator::LtEq => {
-                                    for (_, ids) in self.index.range(..=*v) {
+                                    for (_, ids) in self.index.range(..=v) {
                                         for id in ids {
                                             row_ids.insert(*id);
                                         }
@@ -130,6 +130,7 @@ impl Index for AgeIndex {
         limit: Option<usize>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
         let data = self.create_data_from_filters(filters, limit);
+        log::debug!("Age index data: {data:?}");
 
         Ok(Box::pin(MemoryStream::try_new(
             data,

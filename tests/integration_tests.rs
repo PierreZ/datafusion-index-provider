@@ -63,3 +63,42 @@ async fn test_employee_table_filter_age_lt() {
     assert_names(&results, &["Alice", "David"]);
     assert_ages(&results, &[25, 28]);
 }
+
+#[tokio::test]
+async fn test_employee_table_filter_department_equal() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE department = 'Sales'")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    assert_names(&results, &["Bob", "Eve"]);
+    assert_ages(&results, &[30, 32]);
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_age_and_department_no_result() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age > 30 AND department = 'Engineering'")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    assert_names(&results, &[]);
+    assert_ages(&results, &[]);
+}
+
+#[tokio::test]
+async fn test_employee_table_filter_age_and_department() {
+    let ctx = setup_test_env().await;
+
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age <= 30 AND department = 'Engineering'")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+    assert_names(&results, &["Alice", "David"]);
+    assert_ages(&results, &[25, 28]);
+}

@@ -16,6 +16,7 @@ use datafusion_index_provider::provider::IndexedTableProvider;
 use datafusion_index_provider::types::IndexFilter;
 
 use crate::common::age_index::AgeIndex;
+use crate::common::department_index::DepartmentIndex;
 use crate::common::record_fetcher::BatchMapper;
 
 /// A simple in-memory table provider that stores employee data with an age index
@@ -23,6 +24,7 @@ use crate::common::record_fetcher::BatchMapper;
 pub struct EmployeeTableProvider {
     schema: SchemaRef,
     age_index: Arc<AgeIndex>,
+    department_index: Arc<DepartmentIndex>,
     mapper: Arc<BatchMapper>,
 }
 
@@ -66,6 +68,7 @@ impl EmployeeTableProvider {
         EmployeeTableProvider {
             schema,
             age_index: Arc::new(AgeIndex::new(&age_array, &id_array)),
+            department_index: Arc::new(DepartmentIndex::new(&department_array, &id_array)),
             mapper: Arc::new(BatchMapper::new(vec![batch])),
         }
     }
@@ -121,7 +124,7 @@ impl TableProvider for EmployeeTableProvider {
 #[async_trait]
 impl IndexedTableProvider for EmployeeTableProvider {
     fn indexes(&self) -> Result<Vec<Arc<dyn Index + 'static>>, DataFusionError> {
-        Ok(vec![self.age_index.clone()])
+        Ok(vec![self.age_index.clone(), self.department_index.clone()])
     }
 }
 
