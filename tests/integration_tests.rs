@@ -176,5 +176,4 @@ async fn test_employee_table_filter_or_with_overlapping_conditions() {
 
     assert_names(&results, &["Alice", "David"]);
     assert_ages(&results, &[25, 28]);
-    assert!(false);
 }

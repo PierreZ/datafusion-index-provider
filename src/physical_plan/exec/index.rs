@@ -35,7 +35,9 @@ impl DisplayAs for IndexScanExec {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 let filters: Vec<_> = self.filters.iter().map(|f| f.to_string()).collect();
                 write!(
                     f,

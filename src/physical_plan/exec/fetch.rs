@@ -8,7 +8,7 @@ use datafusion::execution::context::TaskContext;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use log::debug;
+use log::{error, trace};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -174,7 +174,9 @@ impl RecordFetchExec {
 impl DisplayAs for RecordFetchExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 let index_names: Vec<_> = self.indexes.iter().map(|i| i.to_string()).collect();
                 write!(
                     f,
@@ -331,33 +333,33 @@ impl Stream for RecordFetchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        debug!("RecordFetchStream::poll_next");
+        trace!("RecordFetchStream::poll_next");
         loop {
             let state = std::mem::replace(&mut self.state, FetchState::Error);
 
             match state {
                 FetchState::ReadingInput { mut input, fetcher } => {
-                    debug!("RecordFetchStream state: ReadingInput");
+                    trace!("RecordFetchStream state: ReadingInput");
                     match input.poll_next_unpin(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
-                            debug!(
+                            trace!(
                                 "ReadingInput: got input batch with {} rows",
                                 batch.num_rows()
                             );
                             if batch.num_rows() == 0 {
-                                debug!("ReadingInput: input batch is empty, continuing");
+                                trace!("ReadingInput: input batch is empty, continuing");
                                 self.state = FetchState::ReadingInput { input, fetcher };
                                 continue;
                             }
 
                             let fetcher_clone = fetcher.clone();
                             let fut = async move {
-                                debug!(
+                                trace!(
                                     "Fetching: starting fetch for batch with {} rows",
                                     batch.num_rows()
                                 );
                                 let result = fetcher_clone.fetch(batch).await;
-                                debug!("Fetching: fetch finished");
+                                trace!("Fetching: fetch finished");
                                 result.map(|batch| (input, fetcher, batch))
                             }
                             .boxed();
@@ -366,28 +368,28 @@ impl Stream for RecordFetchStream {
                             continue;
                         }
                         Poll::Ready(Some(Err(e))) => {
-                            debug!("ReadingInput: error: {e}");
+                            error!("ReadingInput: error: {e}");
                             self.state = FetchState::Error;
                             return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
                         }
                         Poll::Ready(None) => {
-                            debug!("ReadingInput: input stream is finished");
+                            trace!("ReadingInput: input stream is finished");
                             return self.baseline_metrics.record_poll(Poll::Ready(None));
                         }
                         Poll::Pending => {
-                            debug!("ReadingInput: input stream is pending");
+                            trace!("ReadingInput: input stream is pending");
                             self.state = FetchState::ReadingInput { input, fetcher };
                             return self.baseline_metrics.record_poll(Poll::Pending);
                         }
                     }
                 }
                 FetchState::Fetching(mut fut) => {
-                    debug!("RecordFetchStream state: Fetching");
+                    trace!("RecordFetchStream state: Fetching");
                     match fut.as_mut().poll(cx) {
                         Poll::Ready(Ok((input, fetcher, batch))) => {
-                            debug!("Fetching: got fetched batch with {} rows", batch.num_rows());
+                            trace!("Fetching: got fetched batch with {} rows", batch.num_rows());
                             if batch.num_rows() == 0 {
-                                debug!("Fetching: fetched batch is empty, continuing");
+                                trace!("Fetching: fetched batch is empty, continuing");
                                 self.state = FetchState::ReadingInput { input, fetcher };
                                 continue;
                             }
@@ -399,12 +401,12 @@ impl Stream for RecordFetchStream {
                             continue;
                         }
                         Poll::Ready(Err(e)) => {
-                            debug!("Fetching: error: {e}");
+                            trace!("Fetching: error: {e}");
                             self.state = FetchState::Error;
                             return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
                         }
                         Poll::Pending => {
-                            debug!("Fetching: fetch is pending");
+                            trace!("Fetching: fetch is pending");
                             self.state = FetchState::Fetching(fut);
                             return self.baseline_metrics.record_poll(Poll::Pending);
                         }
@@ -415,7 +417,7 @@ impl Stream for RecordFetchStream {
                     fetcher,
                     batch,
                 } => {
-                    debug!(
+                    trace!(
                         "RecordFetchStream state: Yielding batch with {} rows",
                         batch.num_rows()
                     );
@@ -425,7 +427,7 @@ impl Stream for RecordFetchStream {
                         .record_poll(Poll::Ready(Some(Ok(batch))));
                 }
                 FetchState::Error => {
-                    debug!("RecordFetchStream state: Error");
+                    error!("RecordFetchStream state: Error");
                     return self.baseline_metrics.record_poll(Poll::Ready(None));
                 }
             }
