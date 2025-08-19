@@ -1,9 +1,9 @@
 use std::{any::Any, sync::Arc};
 
-use arrow::array::{Int32Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;

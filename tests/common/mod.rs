@@ -2,7 +2,7 @@ pub mod age_index;
 pub mod employee_provider;
 pub mod record_fetcher;
 
-use arrow::array::{Int32Array, RecordBatch, StringArray};
+use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::execution::context::SessionContext;
 use employee_provider::EmployeeTableProvider;
 use std::collections::HashSet;

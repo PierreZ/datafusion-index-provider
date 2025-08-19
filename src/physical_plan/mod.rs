@@ -7,7 +7,7 @@ pub mod exec;
 pub mod fetcher;
 pub mod joins;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{Result, Statistics};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{utils::expr_to_columns, Expr};

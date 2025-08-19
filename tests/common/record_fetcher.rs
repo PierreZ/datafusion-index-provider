@@ -1,10 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, UInt64Array};
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::arrow::array::{Array, Int32Array, UInt64Array};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
 use datafusion_index_provider::physical_plan::fetcher::RecordFetcher;
 
@@ -52,7 +52,7 @@ fn apply_row_filter(batch: &RecordBatch, row_ids: &[usize]) -> Result<RecordBatc
         .columns()
         .iter()
         .map(|col| {
-            Ok(Arc::new(arrow::compute::take(
+            Ok(Arc::new(datafusion::arrow::compute::take(
                 col.as_ref(),
                 &Int32Array::from_iter_values(row_ids.iter().map(|&i| (i - 1) as i32)),
                 None,

@@ -1,8 +1,8 @@
 //! Defines the [`RecordFetcher`] trait for fetching data based on row IDs.
 
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
 
 /// A trait for fetching full data records based on a batch of row IDs from an index.

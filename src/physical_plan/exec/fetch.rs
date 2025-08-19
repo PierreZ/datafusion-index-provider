@@ -12,8 +12,8 @@ use log::debug;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::{
@@ -389,10 +389,11 @@ mod tests {
     use crate::physical_plan::create_index_schema;
     use crate::physical_plan::Index;
     use crate::physical_plan::ROW_ID_COLUMN_NAME;
-    use arrow::array::UInt64Array;
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
+    use datafusion::arrow::array::StringArray;
+    use datafusion::arrow::array::UInt64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::Statistics;
     use datafusion::logical_expr::Expr;
     use datafusion::physical_plan::joins::HashJoinExec;
@@ -502,7 +503,7 @@ mod tests {
                         self.schema.clone(),
                         vec![
                             Arc::new(row_ids.clone()),
-                            Arc::new(arrow::array::StringArray::from(names)),
+                            Arc::new(StringArray::from(names)),
                         ],
                     )?)
                 }
@@ -573,7 +574,7 @@ mod tests {
                 self.schema.clone(),
                 vec![
                     Arc::new(row_ids.clone()),
-                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(StringArray::from(names)),
                 ],
             )?)
         }
@@ -762,14 +763,14 @@ mod tests {
             fetcher.schema(),
             vec![
                 Arc::new(UInt64Array::from(vec![1, 2])),
-                Arc::new(arrow::array::StringArray::from(vec!["name_1", "name_2"])),
+                Arc::new(StringArray::from(vec!["name_1", "name_2"])),
             ],
         )?;
         let expected_batch2 = RecordBatch::try_new(
             fetcher.schema(),
             vec![
                 Arc::new(UInt64Array::from(vec![3, 4])),
-                Arc::new(arrow::array::StringArray::from(vec!["name_3", "name_4"])),
+                Arc::new(StringArray::from(vec!["name_3", "name_4"])),
             ],
         )?;
 
@@ -917,7 +918,7 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(UInt64Array::from(vec![1, 3, 5])),
-                Arc::new(arrow::array::StringArray::from(expected_names)),
+                Arc::new(StringArray::from(expected_names)),
             ],
         )?;
 
@@ -986,14 +987,14 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(UInt64Array::from(vec![1, 3])),
-                Arc::new(arrow::array::StringArray::from(vec!["name_1", "name_3"])),
+                Arc::new(StringArray::from(vec!["name_1", "name_3"])),
             ],
         )?;
         let expected_batch2 = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(UInt64Array::from(vec![5, 7])),
-                Arc::new(arrow::array::StringArray::from(vec!["name_5", "name_7"])),
+                Arc::new(StringArray::from(vec!["name_5", "name_7"])),
             ],
         )?;
 

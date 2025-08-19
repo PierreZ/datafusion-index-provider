@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
-use arrow::datatypes::DataType;
-use arrow::datatypes::SchemaRef;
+use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
+use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, Operator};
 use datafusion::physical_plan::memory::MemoryStream;

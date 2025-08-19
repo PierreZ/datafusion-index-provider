@@ -1,5 +1,5 @@
 use crate::physical_plan::{create_plan_properties_for_row_id_scan, Index};
-use arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties},
@@ -117,8 +117,8 @@ impl IndexScanExec {
 mod tests {
     use super::*;
     use crate::physical_plan::ROW_ID_COLUMN_NAME;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::Statistics;
     use datafusion::physical_plan::memory::MemoryStream;
     use std::any::Any;

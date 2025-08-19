@@ -76,7 +76,7 @@ pub fn try_create_index_lookup_join(
 mod tests {
     use super::*;
     use crate::physical_plan::create_plan_properties_for_row_id_scan;
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::Statistics;
     use datafusion::execution::context::TaskContext;
     use datafusion::execution::SendableRecordBatchStream;

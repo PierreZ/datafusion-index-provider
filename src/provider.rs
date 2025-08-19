@@ -2,8 +2,8 @@ use crate::physical_plan::exec::fetch::RecordFetchExec;
 use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::Index;
 use crate::types::{IndexFilter, IndexFilters};
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
@@ -132,7 +132,7 @@ mod tests {
     use super::*;
     use crate::physical_plan::Index;
     use crate::physical_plan::ROW_ID_COLUMN_NAME;
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::Session;
     use datafusion::common::Statistics;
     use datafusion::datasource::TableType;
