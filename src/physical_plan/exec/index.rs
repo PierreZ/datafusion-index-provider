@@ -1,4 +1,4 @@
-use crate::physical_plan::Index;
+use crate::physical_plan::{Index, ROW_ID_COLUMN_NAME};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
@@ -135,7 +135,7 @@ impl IndexScanExec {
     ) -> Result<Self, DataFusionError> {
         let ordering = if index.is_ordered() {
             vec![PhysicalSortExpr {
-                expr: Arc::new(Column::new_with_schema("__row_id__", &schema)?),
+                expr: Arc::new(Column::new_with_schema(ROW_ID_COLUMN_NAME, &schema)?),
                 options: Default::default(),
             }]
         } else {

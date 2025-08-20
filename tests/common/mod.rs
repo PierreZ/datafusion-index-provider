@@ -83,3 +83,49 @@ pub fn assert_ages(results: &[RecordBatch], expected_ages: &[i32]) {
         ages
     );
 }
+
+pub fn assert_departments(results: &[RecordBatch], expected_departments: &[&str]) {
+    let mut departments = HashSet::new();
+    for batch in results {
+        let dept_batch = batch
+            .column(3) // department is third in projection
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for dept in dept_batch.iter().flatten() {
+            departments.insert(dept.to_string());
+        }
+    }
+
+    for expected_dept in expected_departments {
+        assert!(
+            departments.contains(*expected_dept),
+            "Department {expected_dept} not found in {departments:?}"
+        );
+    }
+    assert_eq!(
+        departments.len(),
+        expected_departments.len(),
+        "Expected {} departments: {:?}, got {} departments: {:?}",
+        expected_departments.len(),
+        expected_departments,
+        departments.len(),
+        departments
+    );
+}
+
+pub fn extract_names(results: &[RecordBatch]) -> Vec<String> {
+    let mut names = Vec::new();
+    for batch in results {
+        let name_batch = batch
+            .column(1) // name is first in projection
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for name in name_batch.iter().flatten() {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names
+}

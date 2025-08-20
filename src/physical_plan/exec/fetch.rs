@@ -12,7 +12,7 @@ use futures::FutureExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
@@ -27,10 +27,11 @@ use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::joins::try_create_index_lookup_join;
 use crate::physical_plan::{create_index_schema, ROW_ID_COLUMN_NAME};
 use crate::types::{IndexFilter, IndexFilters};
-use datafusion::arrow::datatypes::{DataType, Schema};
+use datafusion::arrow::datatypes::Schema;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::PhysicalExpr;
 
@@ -175,7 +176,15 @@ impl RecordFetchExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match index_filter {
             IndexFilter::Single { index, filter } => {
-                let index_schema = index.index_schema().column_with_name(ROW_ID_COLUMN_NAME).ok_or(DataFusionError::Plan("IndexScanExec requires a column named __row_id__".to_string()))?.1.data_type().clone();
+                let index_schema = index
+                    .index_schema()
+                    .column_with_name(ROW_ID_COLUMN_NAME)
+                    .ok_or(DataFusionError::Plan(
+                        "IndexScanExec requires a column named __row_id__".to_string(),
+                    ))?
+                    .1
+                    .data_type()
+                    .clone();
                 // Use consistent schema for all index scans to avoid union mismatches
                 let consistent_schema = create_index_schema(index_schema);
                 let exec = IndexScanExec::try_new(
@@ -206,30 +215,60 @@ impl RecordFetchExec {
                 Ok(left)
             }
             IndexFilter::Or(filters) => {
-                let plans = filters
+                let original_plans = filters
                     .iter()
                     .map(|f| Self::build_scan_exec(f, limit))
                     .collect::<Result<Vec<_>>>()?;
 
-                if plans.is_empty() {
+                if original_plans.is_empty() {
                     return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
                 }
 
-                // All plans must have the same schema.
-                let first_plan_schema = plans[0].schema();
-                for plan in plans.iter().skip(1) {
-                    if plan.schema() != first_plan_schema {
-                        return Err(DataFusionError::Plan(
-                            "Plans in UnionExec must have the same schema".to_string(),
-                        ));
+                // Create canonical schema for all plans - single __row_id__ column
+                let canonical_schema = create_index_schema(DataType::UInt64);
+
+                // Normalize all plans to have the same canonical schema
+                let mut normalized_plans = Vec::new();
+                for plan in original_plans {
+                    let plan_schema = plan.schema();
+
+                    // Check if this plan needs schema normalization
+                    if plan_schema == canonical_schema {
+                        // Plan already has correct schema, use as-is
+                        normalized_plans.push(plan);
+                    } else {
+                        // Plan has different schema (e.g., HashJoinExec with multiple __row_id__ columns)
+                        // Add projection to normalize to single __row_id__ column
+
+                        // Find the first __row_id__ column index
+                        let row_id_index = plan_schema
+                            .fields()
+                            .iter()
+                            .position(|f| f.name() == ROW_ID_COLUMN_NAME)
+                            .ok_or_else(|| {
+                                DataFusionError::Plan(format!(
+                                    "Plan schema missing required {ROW_ID_COLUMN_NAME} column: {plan_schema:?}"
+                                ))
+                            })?;
+
+                        // Create projection expression to select only the first __row_id__ column
+                        let projection_expr = vec![(
+                            Arc::new(Column::new(ROW_ID_COLUMN_NAME, row_id_index))
+                                as Arc<dyn PhysicalExpr>,
+                            ROW_ID_COLUMN_NAME.to_string(),
+                        )];
+
+                        // Wrap plan with projection to normalize schema
+                        let projection_plan = ProjectionExec::try_new(projection_expr, plan)?;
+
+                        normalized_plans.push(Arc::new(projection_plan) as Arc<dyn ExecutionPlan>);
                     }
                 }
 
-                // Use the schema from the plans for the union.
-                let expected_schema = first_plan_schema.clone();
-                let union_input = Arc::new(UnionExec::new(plans));
+                // Now all plans have identical schemas, UnionExec will work
+                let union_input = Arc::new(UnionExec::new(normalized_plans));
 
-                // Use the expected index schema instead of union schema to avoid mismatches
+                // Create aggregate to deduplicate row IDs
                 let group_expr = PhysicalGroupBy::new_single(vec![(
                     Arc::new(Column::new(ROW_ID_COLUMN_NAME, 0)) as Arc<dyn PhysicalExpr>,
                     ROW_ID_COLUMN_NAME.to_string(),
@@ -241,7 +280,7 @@ impl RecordFetchExec {
                     vec![],
                     vec![],
                     union_input,
-                    expected_schema,
+                    canonical_schema,
                 )?;
 
                 Ok(Arc::new(agg_exec))
