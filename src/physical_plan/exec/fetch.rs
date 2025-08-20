@@ -175,8 +175,9 @@ impl RecordFetchExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match index_filter {
             IndexFilter::Single { index, filter } => {
+                let index_schema = index.index_schema().column_with_name(ROW_ID_COLUMN_NAME).ok_or(DataFusionError::Plan("IndexScanExec requires a column named __row_id__".to_string()))?.1.data_type().clone();
                 // Use consistent schema for all index scans to avoid union mismatches
-                let consistent_schema = create_index_schema(DataType::UInt64);
+                let consistent_schema = create_index_schema(index_schema);
                 let exec = IndexScanExec::try_new(
                     index.clone(),
                     vec![filter.clone()],
@@ -214,8 +215,18 @@ impl RecordFetchExec {
                     return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
                 }
 
-                // Ensure all plans have the same schema before creating union
-                let expected_schema = create_index_schema(DataType::UInt64);
+                // All plans must have the same schema.
+                let first_plan_schema = plans[0].schema();
+                for plan in plans.iter().skip(1) {
+                    if plan.schema() != first_plan_schema {
+                        return Err(DataFusionError::Plan(
+                            "Plans in UnionExec must have the same schema".to_string(),
+                        ));
+                    }
+                }
+
+                // Use the schema from the plans for the union.
+                let expected_schema = first_plan_schema.clone();
                 let union_input = Arc::new(UnionExec::new(plans));
 
                 // Use the expected index schema instead of union schema to avoid mismatches
