@@ -170,8 +170,7 @@ async fn test_employee_table_filter_or_with_overlapping_conditions() {
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
     assert_eq!(
         total_rows, 2,
-        "Expected 2 rows after deduplication, but found {}",
-        total_rows
+        "Expected 2 rows after deduplication, but found {total_rows}"
     );
 
     assert_names(&results, &["Alice", "David"]);
@@ -203,16 +202,13 @@ async fn test_employee_table_filter_extremely_complex_nested_query() {
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
 
     // This query should match Alice (25, Engineering) and David (28, Engineering)
-    assert_eq!(total_rows, 2, "Expected exactly 2 rows, got {}", total_rows);
+    assert_eq!(total_rows, 2, "Expected exactly 2 rows, got {total_rows}");
 
     // Verify we get the expected employees
     assert_names(&results, &["Alice", "David"]);
     assert_ages(&results, &[25, 28]);
 
-    println!(
-        "Complex AND/OR query with precise filtering results: {:?}",
-        results
-    );
+    println!("Complex AND/OR query with precise filtering results: {results:?}");
 }
 
 #[tokio::test]
@@ -244,11 +240,7 @@ async fn test_employee_table_filter_deeply_nested_and_or_combinations() {
     // This should match employees in Engineering/Sales aged 25-30,
     // excluding ages 27,29 unless they're in Engineering and under 29
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert!(
-        total_rows >= 1,
-        "Expected at least 1 row, got {}",
-        total_rows
-    );
+    assert!(total_rows >= 1, "Expected at least 1 row, got {total_rows}");
 
     // Should include Alice (25, Engineering) and David (28, Engineering)
     assert_names(&results, &["Alice", "David"]);
@@ -277,7 +269,7 @@ async fn test_employee_table_filter_complex_and_or_mixed() {
     // - No one from the AND condition (no Engineering employees > 30)
     // - Bob (30, Sales) and Eve (32, Sales) from the OR condition
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 2, "Expected 2 rows, got {}", total_rows);
+    assert_eq!(total_rows, 2, "Expected 2 rows, got {total_rows}");
 
     assert_names(&results, &["Bob", "Eve"]);
     assert_ages(&results, &[30, 32]);
@@ -304,7 +296,7 @@ async fn test_employee_table_filter_multiple_and_conditions_in_or() {
     // - Alice (25, Engineering) and David (28, Engineering) from first AND
     // - Bob (30, Sales) and Eve (32, Sales) from second AND
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 4, "Expected 4 rows, got {}", total_rows);
+    assert_eq!(total_rows, 4, "Expected 4 rows, got {total_rows}");
 
     assert_names(&results, &["Alice", "Bob", "David", "Eve"]);
     assert_ages(&results, &[25, 30, 28, 32]);
@@ -333,7 +325,7 @@ async fn test_employee_table_filter_and_or_with_simple_conditions() {
     // - Bob (30, Sales) and Eve (32, Sales) from department = 'Sales'
     // - David (28, Engineering) from age = 28
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 4, "Expected 4 rows, got {}", total_rows);
+    assert_eq!(total_rows, 4, "Expected 4 rows, got {total_rows}");
 
     assert_names(&results, &["Alice", "Bob", "David", "Eve"]);
     assert_ages(&results, &[25, 30, 28, 32]);
@@ -359,7 +351,7 @@ async fn test_employee_table_filter_nested_and_or_schema_normalization() {
     // Should return David (28, Engineering) and Charlie (35, Marketing), Bob (30, Sales), Eve (32, Sales)
     // From: ((age > 25 AND age < 35) AND department = 'Engineering') OR (department = 'Sales' OR department = 'Marketing')
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 4, "Expected 4 rows, got {}", total_rows);
+    assert_eq!(total_rows, 4, "Expected 4 rows, got {total_rows}");
 
     assert_names(&results, &["Bob", "Charlie", "David", "Eve"]);
     assert_departments(&results, &["Engineering", "Marketing", "Sales"]);
@@ -387,7 +379,7 @@ async fn test_employee_table_filter_triple_or_with_and_conditions() {
     // - Eve (32, Sales) from (age > 30 AND department = 'Sales') - Bob is 30, not > 30
     // - Charlie (35, Marketing) from department = 'Marketing'
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 3, "Expected 3 rows, got {}", total_rows);
+    assert_eq!(total_rows, 3, "Expected 3 rows, got {total_rows}");
 
     assert_names(&results, &["Alice", "Charlie", "Eve"]);
     assert_ages(&results, &[25, 35, 32]);
@@ -416,7 +408,7 @@ async fn test_employee_table_filter_all_and_conditions_in_or() {
     // - Bob (30, Sales) and Eve (32, Sales) from (age >= 30 AND department = 'Sales')
     // - Charlie (35, Marketing) from (age >= 28 AND department = 'Marketing')
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 5, "Expected 5 rows, got {}", total_rows);
+    assert_eq!(total_rows, 5, "Expected 5 rows, got {total_rows}");
 
     assert_names(&results, &["Alice", "Bob", "Charlie", "David", "Eve"]);
 }
@@ -443,7 +435,7 @@ async fn test_employee_table_filter_complex_and_or_deduplication() {
     // However both branches are for Engineering, so Alice matches the second branch
     // Wait, let me check the logs again...actually only David (row_id 4) was returned
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 1, "Expected 1 row, got {}", total_rows);
+    assert_eq!(total_rows, 1, "Expected 1 row, got {total_rows}");
 
     assert_names(&results, &["David"]);
     assert_ages(&results, &[28]);
@@ -479,7 +471,7 @@ async fn test_employee_table_filter_four_way_or_schema_stress_test() {
     // - Charlie (35, Marketing) from department = 'Marketing'
     // - David (28, Engineering) from age = 28
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 5, "Expected 5 rows, got {}", total_rows);
+    assert_eq!(total_rows, 5, "Expected 5 rows, got {total_rows}");
 
     assert_names(&results, &["Alice", "Bob", "Charlie", "David", "Eve"]);
 }
@@ -504,7 +496,7 @@ async fn test_employee_table_filter_deeply_nested_and_or_schema_normalization() 
     // This simplifies to: (age 26-29 OR age 31-34) AND (Engineering OR Sales)
     // Results: David (28, Engineering) and Eve (32, Sales)
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 2, "Expected 2 rows, got {}", total_rows);
+    assert_eq!(total_rows, 2, "Expected 2 rows, got {total_rows}");
 
     assert_names(&results, &["David", "Eve"]);
     assert_ages(&results, &[28, 32]);
@@ -527,7 +519,7 @@ async fn test_employee_table_filter_edge_case_single_and_in_or() {
 
     // Should return no one (Charlie is in Marketing, not Engineering, and no Engineering employees > 30)
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 0, "Expected 0 rows, got {}", total_rows);
+    assert_eq!(total_rows, 0, "Expected 0 rows, got {total_rows}");
 }
 
 #[tokio::test]
@@ -555,7 +547,7 @@ async fn test_employee_table_filter_all_simple_or_conditions() {
     // - Eve (32) again from age = 32
     // But deduplication should give us: Alice, Bob, David, Eve
     let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-    assert_eq!(total_rows, 4, "Expected 4 rows, got {}", total_rows);
+    assert_eq!(total_rows, 4, "Expected 4 rows, got {total_rows}");
 
     assert_names(&results, &["Alice", "Bob", "David", "Eve"]);
     assert_ages(&results, &[25, 30, 28, 32]);

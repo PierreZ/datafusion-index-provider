@@ -32,7 +32,7 @@ impl RecordFetcher for BatchMapper {
     }
 
     async fn fetch(&self, index_batch: RecordBatch) -> Result<RecordBatch> {
-        log::debug!("Index batch: {:?}", index_batch);
+        log::debug!("Index batch: {index_batch:?}");
         let indices = index_batch
             .column(0)
             .as_any()
@@ -40,7 +40,7 @@ impl RecordFetcher for BatchMapper {
             .unwrap();
         let row_ids: Vec<usize> = indices.iter().flatten().map(|i| i as usize).collect();
 
-        log::debug!("Row ids: {:?}", row_ids);
+        log::debug!("Row ids: {row_ids:?}");
 
         apply_row_filter(&self.batches[0], &row_ids)
     }
