@@ -285,7 +285,7 @@ impl RecordFetchExec {
                 }
 
                 // Now all plans have identical schemas, UnionExec will work
-                let union_input = Arc::new(UnionExec::new(normalized_plans));
+                let union_input = UnionExec::try_new(normalized_plans)?;
 
                 // Create aggregate to deduplicate row IDs
                 let group_expr = PhysicalGroupBy::new_single(vec![(
