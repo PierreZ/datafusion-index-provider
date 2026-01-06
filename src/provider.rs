@@ -18,7 +18,7 @@
 use crate::physical_plan::exec::fetch::RecordFetchExec;
 use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::Index;
-use crate::types::{IndexFilter, IndexFilters};
+use crate::types::{IndexFilter, IndexFilters, UnionMode};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
@@ -122,6 +122,20 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
         Ok(None)
     }
 
+    /// Returns the union mode to use for OR conditions in index scans.
+    ///
+    /// # Default implementation
+    /// Returns [`UnionMode::Parallel`], which uses DataFusion's standard `UnionExec`
+    /// and may spawn Tokio tasks for parallel execution.
+    ///
+    /// # When to override
+    /// Override this method to return [`UnionMode::Sequential`] if your runtime
+    /// does not support Tokio task spawning (e.g., custom async executors or
+    /// single-threaded runtimes).
+    fn union_mode(&self) -> UnionMode {
+        UnionMode::default()
+    }
+
     /// Returns whether the filters can be pushed down to the index.
     /// This method can be used in `TableProvider::supports_filters_pushdown`.
     ///
@@ -175,6 +189,7 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
             limit,
             Arc::clone(&mapper),
             schema.clone(),
+            self.union_mode(),
         )?))
     }
 }

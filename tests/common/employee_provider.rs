@@ -13,7 +13,7 @@ use datafusion_common::DataFusionError;
 use datafusion_index_provider::physical_plan::exec::fetch::RecordFetchExec;
 use datafusion_index_provider::physical_plan::Index;
 use datafusion_index_provider::provider::IndexedTableProvider;
-use datafusion_index_provider::types::IndexFilter;
+use datafusion_index_provider::types::{IndexFilter, UnionMode};
 
 use crate::common::age_index::AgeIndex;
 use crate::common::department_index::DepartmentIndex;
@@ -26,6 +26,7 @@ pub struct EmployeeTableProvider {
     age_index: Arc<AgeIndex>,
     department_index: Arc<DepartmentIndex>,
     mapper: Arc<BatchMapper>,
+    union_mode: UnionMode,
 }
 
 impl Default for EmployeeTableProvider {
@@ -70,7 +71,14 @@ impl EmployeeTableProvider {
             age_index: Arc::new(AgeIndex::new(&age_array, &id_array)),
             department_index: Arc::new(DepartmentIndex::new(&department_array, &id_array)),
             mapper: Arc::new(BatchMapper::new(vec![batch])),
+            union_mode: UnionMode::Parallel,
         }
+    }
+
+    /// Set the union mode for OR condition handling.
+    pub fn with_union_mode(mut self, mode: UnionMode) -> Self {
+        self.union_mode = mode;
+        self
     }
 }
 
@@ -142,6 +150,7 @@ impl EmployeeTableProvider {
             limit,
             self.mapper.clone(),
             self.schema.clone(),
+            self.union_mode,
         )?))
     }
 

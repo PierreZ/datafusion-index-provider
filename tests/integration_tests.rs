@@ -1,6 +1,8 @@
 mod common;
 use crate::common::assert_names;
-use common::{assert_ages, assert_departments, extract_names, setup_test_env};
+use common::{
+    assert_ages, assert_departments, extract_names, setup_test_env, setup_test_env_sequential,
+};
 
 // +----+-------+--------+----------+
 // | id | name  | age    | department|
@@ -551,4 +553,103 @@ async fn test_employee_table_filter_all_simple_or_conditions() {
 
     assert_names(&results, &["Alice", "Bob", "David", "Eve"]);
     assert_ages(&results, &[25, 30, 28, 32]);
+}
+
+// =============================================================================
+// Sequential Union Mode Tests
+// =============================================================================
+// These tests verify that UnionMode::Sequential works correctly by using
+// SequentialUnionExec instead of the parallel UnionExec for OR conditions.
+
+#[tokio::test]
+async fn test_sequential_union_mode_simple_or() {
+    let ctx = setup_test_env_sequential().await;
+
+    // Simple OR query that triggers SequentialUnionExec
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age = 25 OR age = 35")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+
+    assert_names(&results, &["Alice", "Charlie"]);
+    assert_ages(&results, &[25, 35]);
+}
+
+#[tokio::test]
+async fn test_sequential_union_mode_multiple_or() {
+    let ctx = setup_test_env_sequential().await;
+
+    // Multiple OR conditions
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age = 25 OR age = 30 OR age = 35")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+
+    assert_names(&results, &["Alice", "Bob", "Charlie"]);
+    assert_ages(&results, &[25, 30, 35]);
+}
+
+#[tokio::test]
+async fn test_sequential_union_mode_mixed_indexes() {
+    let ctx = setup_test_env_sequential().await;
+
+    // OR across different indexes (age and department)
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age = 25 OR department = 'Sales'")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+
+    assert_names(&results, &["Alice", "Bob", "Eve"]);
+    assert_ages(&results, &[25, 30, 32]);
+}
+
+#[tokio::test]
+async fn test_sequential_union_mode_complex_and_or() {
+    let ctx = setup_test_env_sequential().await;
+
+    // Complex query with AND conditions inside OR - tests schema normalization
+    let df = ctx
+        .sql(
+            "SELECT name, age, department FROM employees WHERE
+            (age >= 25 AND department = 'Engineering') OR
+            (age >= 30 AND department = 'Sales')",
+        )
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+
+    // Should return:
+    // - Alice (25, Engineering) and David (28, Engineering) from first AND
+    // - Bob (30, Sales) and Eve (32, Sales) from second AND
+    let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
+    assert_eq!(total_rows, 4, "Expected 4 rows, got {total_rows}");
+
+    assert_names(&results, &["Alice", "Bob", "David", "Eve"]);
+    assert_ages(&results, &[25, 30, 28, 32]);
+    assert_departments(&results, &["Engineering", "Sales"]);
+}
+
+#[tokio::test]
+async fn test_sequential_union_mode_deduplication() {
+    let ctx = setup_test_env_sequential().await;
+
+    // Query with overlapping conditions - tests that deduplication works
+    let df = ctx
+        .sql("SELECT name, age FROM employees WHERE age = 25 OR age < 29")
+        .await
+        .unwrap();
+    let results = df.collect().await.unwrap();
+
+    // Alice (25) matches both conditions, should appear only once
+    let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
+    assert_eq!(
+        total_rows, 2,
+        "Expected 2 rows after deduplication, got {total_rows}"
+    );
+
+    assert_names(&results, &["Alice", "David"]);
+    assert_ages(&results, &[25, 28]);
 }

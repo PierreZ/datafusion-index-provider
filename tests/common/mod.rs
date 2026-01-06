@@ -5,12 +5,23 @@ pub mod record_fetcher;
 
 use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::execution::context::SessionContext;
+use datafusion_index_provider::types::UnionMode;
 use employee_provider::EmployeeTableProvider;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Helper function to setup test environment
+/// Helper function to setup test environment with parallel union mode (default).
 pub async fn setup_test_env() -> SessionContext {
+    setup_test_env_with_mode(UnionMode::Parallel).await
+}
+
+/// Helper function to setup test environment with sequential union mode.
+pub async fn setup_test_env_sequential() -> SessionContext {
+    setup_test_env_with_mode(UnionMode::Sequential).await
+}
+
+/// Helper function to setup test environment with a specific union mode.
+async fn setup_test_env_with_mode(mode: UnionMode) -> SessionContext {
     let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
         .is_test(true)
@@ -18,7 +29,7 @@ pub async fn setup_test_env() -> SessionContext {
 
     let ctx = SessionContext::new();
 
-    let provider = EmployeeTableProvider::default();
+    let provider = EmployeeTableProvider::new().with_union_mode(mode);
     ctx.register_table("employees", Arc::new(provider)).unwrap();
 
     ctx
