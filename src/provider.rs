@@ -203,10 +203,7 @@ mod tests {
     use datafusion::catalog::Session;
     use datafusion::common::Statistics;
     use datafusion::datasource::TableType;
-    use datafusion::execution::TaskContext;
-    use datafusion::physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-    };
+    use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
     use datafusion::prelude::{col, lit};
     use datafusion_common::{DataFusionError, Result};
     use std::any::Any;
@@ -253,49 +250,6 @@ mod tests {
 
         fn statistics(&self) -> Statistics {
             Statistics::new_unknown(&self.index_schema())
-        }
-    }
-
-    // Mock ExecutionPlan
-    #[derive(Debug)]
-    struct MockExec;
-
-    impl DisplayAs for MockExec {
-        fn fmt_as(&self, _t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            unimplemented!()
-        }
-    }
-
-    impl ExecutionPlan for MockExec {
-        fn name(&self) -> &str {
-            "MockExec"
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn properties(&self) -> &PlanProperties {
-            unimplemented!()
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            _children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            Ok(self)
-        }
-
-        fn execute(
-            &self,
-            _partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> Result<SendableRecordBatchStream> {
-            unimplemented!()
         }
     }
 

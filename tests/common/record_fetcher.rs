@@ -28,7 +28,10 @@ impl fmt::Debug for BatchMapper {
 #[async_trait]
 impl RecordFetcher for BatchMapper {
     fn schema(&self) -> SchemaRef {
-        self.batches[0].schema()
+        self.batches
+            .first()
+            .expect("BatchMapper requires at least one batch")
+            .schema()
     }
 
     async fn fetch(&self, index_batch: RecordBatch) -> Result<RecordBatch> {

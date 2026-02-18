@@ -134,6 +134,10 @@ impl IndexedTableProvider for EmployeeTableProvider {
     fn indexes(&self) -> Result<Vec<Arc<dyn Index + 'static>>, DataFusionError> {
         Ok(vec![self.age_index.clone(), self.department_index.clone()])
     }
+
+    fn union_mode(&self) -> UnionMode {
+        self.union_mode
+    }
 }
 
 impl EmployeeTableProvider {
