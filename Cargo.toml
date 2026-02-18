@@ -1,0 +1,28 @@
+[package]
+name = "datafusion-index-provider"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust crate that adds index-based query acceleration to DataFusion TableProviders"
+license = "Apache-2.0"
+repository = "https://github.com/datafusion-contrib/datafusion-index-provider"
+homepage = "https://github.com/datafusion-contrib/datafusion-index-provider"
+documentation = "https://docs.rs/datafusion-index-provider"
+keywords = ["datafusion", "index", "database", "query", "analytics"]
+categories = ["database", "data-structures"]
+readme = "README.md"
+rust-version = "1.75"
+
+[dependencies]
+async-trait = "0.1.89"
+datafusion = { version = "51.0.0", default-features = false }
+datafusion-common = { version = "51.0.0", default-features = false }
+futures = "0.3.31"
+futures-util = "0.3.31"
+futures-core = "0.3.31"
+log = "0.4.28"
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+env_logger = "0.11.8"
+parking_lot = "0.12.5"
+datafusion = { version = "51.0.0", default-features = false, features = ["sql"] }
