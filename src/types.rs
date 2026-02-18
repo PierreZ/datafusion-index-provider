@@ -74,6 +74,30 @@ pub enum IndexFilter {
 /// serves as input to `create_execution_plan_with_indexes()` for physical plan generation.
 pub type IndexFilters = Vec<IndexFilter>;
 
+/// Controls how union operations combine multiple index scans for OR conditions.
+///
+/// When executing disjunctive (OR) queries across multiple indexes, results must be
+/// combined. This enum allows choosing between parallel and sequential execution
+/// strategies based on runtime requirements.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum UnionMode {
+    /// Use standard `UnionExec` with parallel execution.
+    ///
+    /// This mode spawns Tokio tasks via `JoinSet::spawn()` to process partitions
+    /// concurrently. Best for Tokio-based runtimes with good parallelism support.
+    ///
+    /// **Warning**: This mode will panic in non-Tokio async runtimes.
+    #[default]
+    Parallel,
+
+    /// Use `SequentialUnionExec` with single-threaded sequential execution.
+    ///
+    /// This mode processes all input partitions sequentially in a single stream
+    /// without spawning any tasks. Required for non-Tokio runtimes such as
+    /// custom async executors that don't support Tokio task spawning.
+    Sequential,
+}
+
 impl fmt::Display for IndexFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

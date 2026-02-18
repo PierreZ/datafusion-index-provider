@@ -18,3 +18,4 @@
 //! Physical `ExecutionPlan` operators.
 pub mod fetch;
 pub mod index;
+pub mod sequential_union;
