@@ -14,15 +14,15 @@ rust-version = "1.75"
 
 [dependencies]
 async-trait = "0.1.89"
-datafusion = { version = "51.0.0", default-features = false }
-datafusion-common = { version = "51.0.0", default-features = false }
-futures = "0.3.31"
+datafusion = { version = "52.1.0", default-features = false }
+datafusion-common = { version = "52.1.0", default-features = false }
+futures = "0.3.32"
 futures-util = "0.3.31"
 futures-core = "0.3.31"
-log = "0.4.28"
+log = "0.4.29"
 
 [dev-dependencies]
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
-env_logger = "0.11.8"
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+env_logger = "0.11.9"
 parking_lot = "0.12.5"
-datafusion = { version = "51.0.0", default-features = false, features = ["sql"] }
+datafusion = { version = "52.1.0", default-features = false, features = ["sql"] }
