@@ -76,6 +76,7 @@ impl EmployeeTableProvider {
     }
 
     /// Set the union mode for OR condition handling.
+    #[allow(dead_code)]
     pub fn with_union_mode(mut self, mode: UnionMode) -> Self {
         self.union_mode = mode;
         self

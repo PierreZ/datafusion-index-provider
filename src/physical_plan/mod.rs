@@ -24,7 +24,7 @@ pub mod exec;
 pub mod fetcher;
 pub mod joins;
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::{Result, Statistics};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{utils::expr_to_columns, Expr};
@@ -33,28 +33,29 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
 
-/// The name of the column that contains the row ID.
-/// This column is used to join the results of an index scan with the base table.
-pub const ROW_ID_COLUMN_NAME: &str = "__row_id__";
-
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::expressions::Column as PhysicalColumn;
 use datafusion::physical_plan::{Partitioning, PlanProperties};
 use std::sync::Arc;
 
-/// Creates a `PlanProperties` for a scan that is potentially ordered by the row ID.
+/// Creates a `PlanProperties` for a scan that is potentially ordered by the primary key columns.
 ///
 /// # Arguments
-/// * `schema` - The schema of the output plan.
-/// * `ordered` - Whether the output is ordered by the row ID.
-pub fn create_plan_properties_for_row_id_scan(schema: SchemaRef, ordered: bool) -> PlanProperties {
-    let mut eq_properties = EquivalenceProperties::new(schema);
+/// * `schema` - The schema of the output plan. All columns are treated as primary key columns.
+/// * `ordered` - Whether the output is ordered by the primary key columns.
+pub fn create_plan_properties_for_pk_scan(schema: SchemaRef, ordered: bool) -> PlanProperties {
+    let mut eq_properties = EquivalenceProperties::new(schema.clone());
     if ordered {
-        let sort_expr =
-            PhysicalSortExpr::new_default(Arc::new(PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0)))
-                .asc();
-        eq_properties.add_ordering(vec![sort_expr]);
+        let sort_exprs: Vec<PhysicalSortExpr> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                PhysicalSortExpr::new_default(Arc::new(PhysicalColumn::new(field.name(), i))).asc()
+            })
+            .collect();
+        eq_properties.add_ordering(sort_exprs);
     }
     PlanProperties::new(
         eq_properties,
@@ -64,17 +65,30 @@ pub fn create_plan_properties_for_row_id_scan(schema: SchemaRef, ordered: bool) 
     )
 }
 
-/// Creates a schema for an index with a single column of the specified data type.
-/// The column will be named [`ROW_ID_COLUMN_NAME`].
+/// Creates a schema for an index with the specified fields.
+///
+/// All columns in the schema are treated as forming the composite row identifier
+/// (primary key). For single-column primary keys, pass a single field.
 ///
 /// # Arguments
-/// * `data_type` - The data type of the row ID column.
-pub fn create_index_schema(data_type: DataType) -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        ROW_ID_COLUMN_NAME,
-        data_type,
-        false,
-    )]))
+/// * `fields` - The fields that form the composite primary key.
+///
+/// # Examples
+/// ```
+/// use datafusion::arrow::datatypes::{DataType, Field};
+/// use datafusion_index_provider::physical_plan::create_index_schema;
+///
+/// // Single-column primary key
+/// let schema = create_index_schema([Field::new("id", DataType::UInt64, false)]);
+///
+/// // Composite primary key
+/// let schema = create_index_schema([
+///     Field::new("tenant_id", DataType::Utf8, false),
+///     Field::new("row_id", DataType::UInt64, false),
+/// ]);
+/// ```
+pub fn create_index_schema(fields: impl IntoIterator<Item = Field>) -> SchemaRef {
+    Arc::new(Schema::new(fields.into_iter().collect::<Vec<_>>()))
 }
 
 /// Represents a physical index that can be scanned to find row IDs.
@@ -89,8 +103,11 @@ pub trait Index: fmt::Debug + Send + Sync + 'static {
     /// Returns the name of this index.
     fn name(&self) -> &str;
 
-    /// Returns the schema of the index output, which must consist of a single
-    /// column named [`ROW_ID_COLUMN_NAME`].
+    /// Returns the schema of the index output.
+    ///
+    /// All columns in this schema form the composite row identifier (primary key).
+    /// The downstream pipeline uses these columns for joining (AND operations),
+    /// deduplication (OR operations), and fetching records.
     fn index_schema(&self) -> SchemaRef;
 
     /// Returns the name of the table this index belongs to.
@@ -113,7 +130,7 @@ pub trait Index: fmt::Debug + Send + Sync + 'static {
         Ok(columns.iter().any(|col| col.name == self.column_name()))
     }
 
-    /// Returns indication if the index is ordered by the row ID.
+    /// Returns indication if the index is ordered by the primary key columns.
     ///
     /// # Default implementation
     /// The default implementation returns `false`.
@@ -121,7 +138,7 @@ pub trait Index: fmt::Debug + Send + Sync + 'static {
         false
     }
 
-    /// Creates a stream of row IDs that satisfy the given filters.
+    /// Creates a stream of primary key values that satisfy the given filters.
     ///
     /// The output of this stream MUST have a schema matching [`Self::index_schema()`].
     fn scan(

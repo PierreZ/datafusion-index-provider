@@ -29,7 +29,7 @@ use futures::FutureExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
@@ -43,9 +43,7 @@ use crate::physical_plan::exec::index::IndexScanExec;
 use crate::physical_plan::exec::sequential_union::SequentialUnionExec;
 use crate::physical_plan::fetcher::RecordFetcher;
 use crate::physical_plan::joins::try_create_index_lookup_join;
-use crate::physical_plan::{create_index_schema, ROW_ID_COLUMN_NAME};
 use crate::types::{IndexFilter, IndexFilters, UnionMode};
-use datafusion::arrow::datatypes::Schema;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::Column;
@@ -129,11 +127,11 @@ impl RecordFetchExec {
         })
     }
 
-    /// Builds the input execution plan that produces row IDs based on the IndexFilter structure.
+    /// Builds the input execution plan that produces primary key values based on the IndexFilter structure.
     ///
     /// This method is the core of the index-based execution plan generation. It recursively
     /// processes the [`IndexFilter`] tree to create an optimized physical plan that efficiently
-    /// produces row IDs matching the query filters.
+    /// produces primary key values matching the query filters.
     ///
     /// # Plan Generation Strategy
     ///
@@ -148,32 +146,29 @@ impl RecordFetchExec {
     /// ```
     ///
     /// ## [`IndexFilter::And`] - Index Intersection via Joins
-    /// Builds a left-deep tree of joins to intersect row IDs from multiple indexes.
-    /// The joins are performed on the `row_id` column to find rows that satisfy ALL conditions.
+    /// Builds a left-deep tree of joins to intersect primary key values from multiple indexes.
+    /// The joins are performed on all primary key columns to find rows that satisfy ALL conditions.
     /// Uses [`crate::physical_plan::joins::try_create_index_lookup_join`] which selects between
     /// HashJoin and SortMergeJoin based on input ordering.
     ///
     /// ```text
-    /// HashJoin/SortMergeJoin(
-    ///   HashJoin/SortMergeJoin(
-    ///     IndexScanExec(index1, filter1),
-    ///     IndexScanExec(index2, filter2)
-    ///   ),
-    ///   IndexScanExec(index3, filter3)
-    /// )
+    /// Projection(PK columns)
+    /// └── HashJoin/SortMergeJoin(
+    ///       Projection(PK columns)
+    ///       └── HashJoin/SortMergeJoin(
+    ///             IndexScanExec(index1, filter1),
+    ///             IndexScanExec(index2, filter2)
+    ///           ),
+    ///       IndexScanExec(index3, filter3)
+    ///     )
     /// ```
     ///
-    /// This approach:
-    /// - Processes filters left-to-right, building joins incrementally
-    /// - Each join reduces the result set, making subsequent joins more efficient
-    /// - Preserves only row IDs that appear in ALL index scans
-    ///
     /// ## [`IndexFilter::Or`] - Union with Deduplication
-    /// Creates a [`UnionExec`] of all index scans followed by an [`AggregateExec`] that groups by
-    /// `row_id` to automatically deduplicate overlapping results.
+    /// Creates a [`UnionExec`](datafusion::physical_plan::union::UnionExec) of all index scans followed by an [`AggregateExec`] that groups by
+    /// all primary key columns to automatically deduplicate overlapping results.
     ///
     /// ```text
-    /// AggregateExec(GROUP BY row_id,
+    /// AggregateExec(GROUP BY PK columns,
     ///   UnionExec(
     ///     IndexScanExec(index1, filter1),
     ///     IndexScanExec(index2, filter2),
@@ -182,20 +177,14 @@ impl RecordFetchExec {
     /// )
     /// ```
     ///
-    /// This approach:
-    /// - Combines results from multiple indexes that satisfy ANY of the conditions
-    /// - Automatically deduplicates row IDs that appear in multiple index results
-    /// - Ensures each row is fetched only once in the subsequent fetch phase
-    /// - Handles empty filter lists by returning an empty execution plan
-    ///
     /// # Arguments
     /// * `index_filter` - The [`IndexFilter`] tree specifying which indexes to scan and how to combine them
     /// * `limit` - Optional limit on the number of rows to return, passed through to individual index scans
     /// * `union_mode` - Controls whether OR conditions use parallel or sequential union
     ///
     /// # Returns
-    /// An [`Arc<dyn ExecutionPlan>`] that produces a stream of row IDs matching the filter criteria.
-    /// The output schema always contains a single column named [`ROW_ID_COLUMN_NAME`].
+    /// An [`Arc<dyn ExecutionPlan>`] that produces a stream of primary key values matching the filter criteria.
+    /// The output schema contains all columns from the index schema (the composite primary key).
     ///
     /// # Errors
     /// Returns [`DataFusionError::Plan`] if:
@@ -209,23 +198,9 @@ impl RecordFetchExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match index_filter {
             IndexFilter::Single { index, filter } => {
-                let index_schema = index
-                    .index_schema()
-                    .column_with_name(ROW_ID_COLUMN_NAME)
-                    .ok_or(DataFusionError::Plan(
-                        "IndexScanExec requires a column named __row_id__".to_string(),
-                    ))?
-                    .1
-                    .data_type()
-                    .clone();
-                // Use consistent schema for all index scans to avoid union mismatches
-                let consistent_schema = create_index_schema(index_schema);
-                let exec = IndexScanExec::try_new(
-                    index.clone(),
-                    vec![filter.clone()],
-                    limit,
-                    consistent_schema,
-                )?;
+                let schema = index.index_schema();
+                let exec =
+                    IndexScanExec::try_new(index.clone(), vec![filter.clone()], limit, schema)?;
                 Ok(Arc::new(exec))
             }
             IndexFilter::And(filters) => {
@@ -241,9 +216,11 @@ impl RecordFetchExec {
                 }
 
                 let mut left = plans.remove(0);
+                let pk_schema = left.schema();
                 while !plans.is_empty() {
                     let right = plans.remove(0);
-                    left = try_create_index_lookup_join(left, right)?;
+                    let joined = try_create_index_lookup_join(left, right)?;
+                    left = Self::project_to_pk_schema(joined, &pk_schema)?;
                 }
                 Ok(left)
             }
@@ -257,48 +234,16 @@ impl RecordFetchExec {
                     return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
                 }
 
-                // Create canonical schema for all plans - single __row_id__ column
-                let canonical_schema = create_index_schema(DataType::UInt64);
+                // Derive canonical PK schema from the first plan
+                let canonical_schema = original_plans[0].schema();
 
-                // Normalize all plans to have the same canonical schema
-                let mut normalized_plans = Vec::new();
-                for plan in original_plans {
-                    let plan_schema = plan.schema();
+                // Normalize all plans to the canonical schema
+                let normalized_plans: Vec<Arc<dyn ExecutionPlan>> = original_plans
+                    .into_iter()
+                    .map(|plan| Self::project_to_pk_schema(plan, &canonical_schema))
+                    .collect::<Result<Vec<_>>>()?;
 
-                    // Check if this plan needs schema normalization
-                    if plan_schema == canonical_schema {
-                        // Plan already has correct schema, use as-is
-                        normalized_plans.push(plan);
-                    } else {
-                        // Plan has different schema (e.g., HashJoinExec with multiple __row_id__ columns)
-                        // Add projection to normalize to single __row_id__ column
-
-                        // Find the first __row_id__ column index
-                        let row_id_index = plan_schema
-                            .fields()
-                            .iter()
-                            .position(|f| f.name() == ROW_ID_COLUMN_NAME)
-                            .ok_or_else(|| {
-                                DataFusionError::Plan(format!(
-                                    "Plan schema missing required {ROW_ID_COLUMN_NAME} column: {plan_schema:?}"
-                                ))
-                            })?;
-
-                        // Create projection expression to select only the first __row_id__ column
-                        let projection_expr = vec![(
-                            Arc::new(Column::new(ROW_ID_COLUMN_NAME, row_id_index))
-                                as Arc<dyn PhysicalExpr>,
-                            ROW_ID_COLUMN_NAME.to_string(),
-                        )];
-
-                        // Wrap plan with projection to normalize schema
-                        let projection_plan = ProjectionExec::try_new(projection_expr, plan)?;
-
-                        normalized_plans.push(Arc::new(projection_plan) as Arc<dyn ExecutionPlan>);
-                    }
-                }
-
-                // Now all plans have identical schemas - create union based on mode
+                // Create union based on mode
                 let union_input: Arc<dyn ExecutionPlan> = match union_mode {
                     UnionMode::Parallel => UnionExec::try_new(normalized_plans)?,
                     UnionMode::Sequential => {
@@ -306,15 +251,24 @@ impl RecordFetchExec {
                     }
                 };
 
-                // Create aggregate to deduplicate row IDs
-                let group_expr = PhysicalGroupBy::new_single(vec![(
-                    Arc::new(Column::new(ROW_ID_COLUMN_NAME, 0)) as Arc<dyn PhysicalExpr>,
-                    ROW_ID_COLUMN_NAME.to_string(),
-                )]);
+                // Create aggregate to deduplicate by ALL primary key columns
+                let group_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = canonical_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        (
+                            Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                            field.name().to_string(),
+                        )
+                    })
+                    .collect();
+
+                let group_by = PhysicalGroupBy::new_single(group_exprs);
 
                 let agg_exec = AggregateExec::try_new(
                     AggregateMode::Single,
-                    group_expr,
+                    group_by,
                     vec![],
                     vec![],
                     union_input,
@@ -324,6 +278,54 @@ impl RecordFetchExec {
                 Ok(Arc::new(agg_exec))
             }
         }
+    }
+
+    /// Projects a plan's output down to the primary key schema columns.
+    ///
+    /// After a join, the output may contain duplicate columns from both sides
+    /// (e.g., `(a_left, b_left, a_right, b_right)`). This projects to just the
+    /// first occurrence of each PK column.
+    fn project_to_pk_schema(
+        plan: Arc<dyn ExecutionPlan>,
+        pk_schema: &SchemaRef,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan_schema = plan.schema();
+
+        // Short-circuit if schemas already match
+        if plan_schema.fields().len() == pk_schema.fields().len()
+            && pk_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .all(|(i, f)| plan_schema.field(i) == f.as_ref())
+        {
+            return Ok(plan);
+        }
+
+        // Build projection selecting first occurrence of each PK column
+        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = pk_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let idx = plan_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == field.name())
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "Primary key column '{}' not found in plan schema: {:?}",
+                            field.name(),
+                            plan_schema
+                        ))
+                    })?;
+                Ok((
+                    Arc::new(Column::new(field.name(), idx)) as Arc<dyn PhysicalExpr>,
+                    field.name().to_string(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
     }
 }
 
@@ -568,7 +570,6 @@ mod tests {
     use super::*;
     use crate::physical_plan::create_index_schema;
     use crate::physical_plan::Index;
-    use crate::physical_plan::ROW_ID_COLUMN_NAME;
     use async_trait::async_trait;
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::array::UInt64Array;
@@ -584,6 +585,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    const PK_COL: &str = "id";
+
     // --- Mock Index ---
     #[derive(Debug)]
     struct MockIndex {
@@ -595,7 +598,7 @@ mod tests {
     impl MockIndex {
         fn new(batches: Vec<RecordBatch>) -> Self {
             Self {
-                schema: create_index_schema(DataType::UInt64),
+                schema: create_index_schema([Field::new(PK_COL, DataType::UInt64, false)]),
                 scan_called: Mutex::new(false),
                 batches,
             }
@@ -648,7 +651,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 schema: Arc::new(Schema::new(vec![
-                    Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+                    Field::new(PK_COL, DataType::UInt64, false),
                     Field::new("name", DataType::Utf8, false),
                 ])),
             }
@@ -668,7 +671,7 @@ mod tests {
 
                 async fn fetch(&self, index_batch: RecordBatch) -> Result<RecordBatch> {
                     let row_ids = index_batch
-                        .column_by_name(ROW_ID_COLUMN_NAME)
+                        .column_by_name(PK_COL)
                         .unwrap()
                         .as_any()
                         .downcast_ref::<UInt64Array>()
@@ -718,7 +721,7 @@ mod tests {
         fn new(names: Vec<String>) -> Self {
             Self {
                 schema: Arc::new(Schema::new(vec![
-                    Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+                    Field::new(PK_COL, DataType::UInt64, false),
                     Field::new("name", DataType::Utf8, false),
                 ])),
                 names,
@@ -737,7 +740,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
 
             let row_ids = index_batch
-                .column_by_name(ROW_ID_COLUMN_NAME)
+                .column_by_name(PK_COL)
                 .unwrap()
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -766,7 +769,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let _task_ctx = session_ctx.task_ctx();
         let schema = Arc::new(Schema::new(vec![Field::new(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             DataType::UInt64,
             false,
         )]));
@@ -809,7 +812,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let _task_ctx = session_ctx.task_ctx();
         let schema = Arc::new(Schema::new(vec![Field::new(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             DataType::UInt64,
             false,
         )]));
@@ -859,7 +862,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let _task_ctx = session_ctx.task_ctx();
         let schema = Arc::new(Schema::new(vec![Field::new(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             DataType::UInt64,
             false,
         )]));
@@ -913,7 +916,7 @@ mod tests {
 
         // 1. Setup input stream with an empty batch in the middle
         let schema = Arc::new(Schema::new(vec![Field::new(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             DataType::UInt64,
             false,
         )]));
@@ -986,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_fetch_exec_single_index() -> Result<()> {
         let index_batch = RecordBatch::try_from_iter(vec![(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             Arc::new(UInt64Array::from(vec![1, 3])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
@@ -1013,13 +1016,13 @@ mod tests {
     async fn test_record_fetch_exec_multiple_indexes() -> Result<()> {
         // Create two indexes that return different row IDs
         let index1_batch = RecordBatch::try_from_iter(vec![(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             Arc::new(UInt64Array::from(vec![1, 3])) as _,
         )])?;
         let index1 = Arc::new(MockIndex::new(vec![index1_batch]));
 
         let index2_batch = RecordBatch::try_from_iter(vec![(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             Arc::new(UInt64Array::from(vec![3, 5])) as _,
         )])?;
         let index2 = Arc::new(MockIndex::new(vec![index2_batch]));
@@ -1044,8 +1047,14 @@ mod tests {
             UnionMode::Parallel,
         )?;
 
-        // The input plan should be a HashJoinExec
-        assert_eq!(exec.input.name(), "HashJoinExec");
+        // The input plan should be a ProjectionExec wrapping a HashJoinExec
+        assert_eq!(exec.input.name(), "ProjectionExec");
+        let projection = exec
+            .input
+            .as_any()
+            .downcast_ref::<ProjectionExec>()
+            .unwrap();
+        assert_eq!(projection.children()[0].name(), "HashJoinExec");
         Ok(())
     }
 
@@ -1054,7 +1063,7 @@ mod tests {
         let mut indexes_vec = Vec::new();
         for i in 0..5 {
             let batch = RecordBatch::try_from_iter(vec![(
-                ROW_ID_COLUMN_NAME,
+                PK_COL,
                 Arc::new(UInt64Array::from(vec![i, i + 1, i + 2])) as _,
             )])?;
             indexes_vec.push(IndexFilter::Single {
@@ -1073,14 +1082,14 @@ mod tests {
             UnionMode::Parallel,
         )?;
 
-        // The input plan should be a tree of HashJoinExecs
-        assert_eq!(exec.input.name(), "HashJoinExec");
+        // The input plan should be a ProjectionExec at the top
+        assert_eq!(exec.input.name(), "ProjectionExec");
 
         fn count_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
             if let Some(join_exec) = plan.as_any().downcast_ref::<HashJoinExec>() {
                 1 + count_joins(join_exec.children()[0]) + count_joins(join_exec.children()[1])
             } else {
-                0
+                plan.children().iter().map(|c| count_joins(c)).sum()
             }
         }
 
@@ -1094,7 +1103,7 @@ mod tests {
     async fn test_record_fetch_exec_execute() -> Result<()> {
         // 1. Setup mocks
         let index_batch = RecordBatch::try_from_iter(vec![(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             Arc::new(UInt64Array::from(vec![1, 3, 5])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
@@ -1171,11 +1180,11 @@ mod tests {
     async fn test_record_fetch_exec_execute_multiple_batches() -> Result<()> {
         // 1. Setup mocks with multiple batches
         let batch1 = RecordBatch::try_from_iter(vec![(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             Arc::new(UInt64Array::from(vec![1, 3])) as _,
         )])?;
         let batch2 = RecordBatch::try_from_iter(vec![(
-            ROW_ID_COLUMN_NAME,
+            PK_COL,
             Arc::new(UInt64Array::from(vec![5, 7])) as _,
         )])?;
         let index = Arc::new(MockIndex::new(vec![batch1, batch2]));
@@ -1233,10 +1242,8 @@ mod tests {
             }
         }
 
-        let index_batch = RecordBatch::try_from_iter(vec![(
-            ROW_ID_COLUMN_NAME,
-            Arc::new(UInt64Array::from(vec![1])) as _,
-        )])?;
+        let index_batch =
+            RecordBatch::try_from_iter(vec![(PK_COL, Arc::new(UInt64Array::from(vec![1])) as _)])?;
         let index = Arc::new(MockIndex::new(vec![index_batch]));
         let indexes = vec![IndexFilter::Single {
             index: index.clone() as Arc<dyn Index>,

@@ -22,53 +22,69 @@
 //! AND conditions across multiple indexed columns by finding the intersection of
 //! row IDs that satisfy all individual predicates.
 
-use super::ROW_ID_COLUMN_NAME;
 use datafusion::common::Result;
 use datafusion::logical_expr::JoinType;
 use datafusion::physical_expr::expressions::Column as PhysicalColumn;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
-use datafusion_common::NullEquality;
+use datafusion_common::{DataFusionError, NullEquality};
 use std::sync::Arc;
 
-/// Creates an optimized join execution plan to intersect row IDs from two index scans.
+/// Creates an optimized join execution plan to intersect primary key values from two index scans.
 ///
 /// This function automatically selects the most efficient join algorithm based on the
 /// ordering properties of the input execution plans:
 ///
 /// ## Join Algorithm Selection
-/// - **SortMergeJoin**: Used when both inputs are ordered by row ID, providing O(n+m) complexity
+/// - **SortMergeJoin**: Used when both inputs are ordered by primary key, providing O(n+m) complexity
 /// - **HashJoin**: Used when inputs are unordered, providing O(n+m) average complexity with O(n) space
 ///
 /// ## Performance Characteristics
 /// - **SortMergeJoin**: Memory-efficient streaming join, ideal for large ordered datasets
 /// - **HashJoin**: Builds hash table from left input, efficient for smaller left side
 ///
-/// The join is always an INNER join since the goal is to find row IDs that satisfy
-/// ALL conditions (intersection semantics for AND operations).
+/// The join is always an INNER join since the goal is to find primary key values that satisfy
+/// ALL conditions (intersection semantics for AND operations). The join is performed on
+/// all columns in the schema, which collectively form the composite primary key.
 ///
 /// # Arguments
-/// * `left` - Left execution plan producing row IDs (typically becomes hash table in HashJoin)
-/// * `right` - Right execution plan producing row IDs
+/// * `left` - Left execution plan producing primary key values (typically becomes hash table in HashJoin)
+/// * `right` - Right execution plan producing primary key values
 ///
 /// # Returns
-/// An execution plan that produces row IDs present in both inputs, maintaining the
-/// row ID schema with a single `__row_id__` column.
+/// An execution plan that produces primary key values present in both inputs.
 ///
 /// # Performance Tips
 /// For optimal performance:
 /// - Place the more selective index scan on the left side for HashJoin
-/// - Ensure row ID columns are properly typed and indexed
+/// - Ensure primary key columns are properly typed and indexed
 /// - Consider the memory vs. CPU trade-offs between join algorithms
 pub fn try_create_index_lookup_join(
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    // Create join columns - both inputs have the row ID column at index 0
-    let join_on = vec![(
-        Arc::new(PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0)) as Arc<dyn PhysicalExpr>,
-        Arc::new(PhysicalColumn::new(ROW_ID_COLUMN_NAME, 0)) as Arc<dyn PhysicalExpr>,
-    )];
+    let left_schema = left.schema();
+    let right_schema = right.schema();
+
+    // Create join columns for all primary key columns
+    let join_on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = left_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let right_idx = right_schema.index_of(field.name()).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "PK column '{}' not found in right join schema: {:?}",
+                    field.name(),
+                    right_schema
+                ))
+            })?;
+            Ok((
+                Arc::new(PhysicalColumn::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                Arc::new(PhysicalColumn::new(field.name(), right_idx)) as Arc<dyn PhysicalExpr>,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // Check if both inputs are sorted the same way for SortMergeJoin optimization
     let both_sorted = match (
@@ -107,7 +123,7 @@ pub fn try_create_index_lookup_join(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physical_plan::create_plan_properties_for_row_id_scan;
+    use crate::physical_plan::create_plan_properties_for_pk_scan;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::Statistics;
     use datafusion::execution::context::TaskContext;
@@ -126,13 +142,9 @@ mod tests {
 
     impl MockExec {
         fn new(ordered: bool) -> Self {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                ROW_ID_COLUMN_NAME,
-                DataType::UInt64,
-                false,
-            )]));
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
 
-            let plan_properties = create_plan_properties_for_row_id_scan(schema.clone(), ordered);
+            let plan_properties = create_plan_properties_for_pk_scan(schema.clone(), ordered);
 
             Self {
                 plan_properties,
