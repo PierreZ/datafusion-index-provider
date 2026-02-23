@@ -26,8 +26,8 @@
 //!
 //! The crate implements a two-phase execution model:
 //!
-//! 1. **Index Phase**: Scan one or more indexes to identify row IDs matching the query filters
-//! 2. **Fetch Phase**: Use the row IDs to fetch complete records from the underlying storage
+//! 1. **Index Phase**: Scan one or more indexes to identify primary key values matching the query filters
+//! 2. **Fetch Phase**: Use the primary key values to fetch complete records from the underlying storage
 //!
 //! This approach is particularly effective for selective queries where indexes can significantly
 //! reduce the number of rows that need to be fetched from primary storage.
@@ -35,14 +35,14 @@
 //! ## Core Components
 //!
 //! ### Index Management
-//! - [`physical_plan::Index`]: Trait representing a physical index that can be scanned to retrieve row IDs
+//! - [`physical_plan::Index`]: Trait representing a physical index that can be scanned to retrieve primary key values
 //! - [`provider::IndexedTableProvider`]: Extension of DataFusion's `TableProvider` with index discovery
 //! - [`types::IndexFilter`]: Enum representing filter operations that can be pushed down to indexes
 //!
 //! ### Execution Engine  
 //! - [`physical_plan::exec::fetch::RecordFetchExec`]: Top-level execution plan orchestrating the two phases
 //! - [`physical_plan::exec::index::IndexScanExec`]: Execution plan for scanning a single index
-//! - [`physical_plan::fetcher::RecordFetcher`]: Trait for fetching complete records using row IDs
+//! - [`physical_plan::fetcher::RecordFetcher`]: Trait for fetching complete records using primary key values
 //!
 //! ## Query Capabilities
 //!
@@ -105,23 +105,25 @@
 //! ### IndexFilter::And - Index Intersection
 //!
 //! For conjunctive conditions across multiple indexes, the system builds a left-deep tree
-//! of joins to intersect row IDs:
+//! of joins to intersect primary key values:
 //! ```text
 //! RecordFetchExec
-//! └── HashJoin/SortMergeJoin (INNER on row_id)
-//!     ├── HashJoin/SortMergeJoin (INNER on row_id)
-//!     │   ├── IndexScanExec (col_a_index)
-//!     │   └── IndexScanExec (col_b_index)
-//!     └── IndexScanExec (col_c_index)
+//! └── Projection(PK columns)
+//!     └── HashJoin/SortMergeJoin (INNER on PK columns)
+//!         ├── Projection(PK columns)
+//!         │   └── HashJoin/SortMergeJoin (INNER on PK columns)
+//!         │       ├── IndexScanExec (col_a_index)
+//!         │       └── IndexScanExec (col_b_index)
+//!         └── IndexScanExec (col_c_index)
 //! ```
 //!
 //! ### IndexFilter::Or - Union with Deduplication
 //!
 //! For disjunctive conditions, the system uses `UnionExec` followed by `AggregateExec`
-//! for automatic row ID deduplication:
+//! for automatic primary key deduplication:
 //! ```text
 //! RecordFetchExec
-//! └── AggregateExec (GROUP BY row_id)
+//! └── AggregateExec (GROUP BY PK columns)
 //!     └── UnionExec
 //!         ├── IndexScanExec (col_a)
 //!         ├── IndexScanExec (col_b)
@@ -133,8 +135,8 @@
 //!
 //! ## Implementation Guide
 //!
-//! - **Implement the Index Trait**: Create indexes that can scan and return row IDs
-//! - **Implement the RecordFetcher Trait**: Define how to fetch complete records using row IDs
+//! - **Implement the Index Trait**: Create indexes that can scan and return primary key values
+//! - **Implement the RecordFetcher Trait**: Define how to fetch complete records using primary key values
 //! - **Implement IndexedTableProvider**: Expose available indexes and filter analysis capabilities
 //! - **Update TableProvider Implementation**: Integrate index-based execution into your scan method
 //!
@@ -148,7 +150,7 @@
 //! ### Memory Usage
 //! - **Index results**: Streamed through execution pipeline to minimize memory footprint
 //! - **Join operations**: Hash joins require memory proportional to smaller index result set
-//! - **Deduplication**: OR operations require memory to store unique row IDs during aggregation
+//! - **Deduplication**: OR operations require memory to store unique primary key values during aggregation
 //!
 //! ### Bounded Execution
 //! - **Single partition requirement**: [`physical_plan::exec::fetch::RecordFetchExec`] requires single partition input for correct result merging

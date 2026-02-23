@@ -6,8 +6,8 @@ A library that extends [Apache DataFusion](https://github.com/apache/datafusion)
 
 This crate implements a two-phase execution model for index-accelerated queries:
 
-1. **Index Phase**: Scan one or more secondary indexes to identify row IDs matching filter predicates
-2. **Fetch Phase**: Use row IDs to fetch complete records from underlying storage
+1. **Index Phase**: Scan one or more secondary indexes to identify primary key values matching filter predicates
+2. **Fetch Phase**: Use primary key values to fetch complete records from underlying storage
 
 This approach reduces I/O by limiting data retrieval to rows that satisfy query predicates, particularly effective for selective queries (typically < 10% of rows).
 
@@ -24,7 +24,7 @@ datafusion-index-provider = "0.1.0"
 
 ### Index Trait
 
-Implement the [`Index`](src/physical_plan/mod.rs) trait to define how your index scans for matching row IDs:
+Implement the [`Index`](src/physical_plan/mod.rs) trait to define how your index scans for matching primary key values:
 
 ```rust
 use datafusion_index_provider::physical_plan::Index;
@@ -32,12 +32,15 @@ use datafusion_index_provider::physical_plan::Index;
 impl Index for MyIndex {
     fn name(&self) -> &str { "my_index" }
     fn column_name(&self) -> &str { "indexed_column" }
-    fn index_schema(&self) -> SchemaRef { /* schema with __row_id__ column */ }
+    fn index_schema(&self) -> SchemaRef {
+        // Schema whose columns form the composite primary key
+        // e.g. create_index_schema([Field::new("id", DataType::UInt64, false)])
+    }
     fn table_name(&self) -> &str { "my_table" }
 
     fn scan(&self, filters: &[Expr], limit: Option<usize>)
         -> Result<SendableRecordBatchStream> {
-        // Return RecordBatch stream with __row_id__ column containing matching IDs
+        // Return RecordBatch stream with primary key columns matching the filters
     }
 
     fn statistics(&self) -> Statistics { /* index statistics */ }
@@ -46,16 +49,16 @@ impl Index for MyIndex {
 
 ### RecordFetcher Trait
 
-Implement [`RecordFetcher`](src/physical_plan/fetcher.rs) to define how complete records are retrieved using row IDs:
+Implement [`RecordFetcher`](src/physical_plan/fetcher.rs) to define how complete records are retrieved using primary key values:
 
 ```rust
 use datafusion_index_provider::physical_plan::fetcher::RecordFetcher;
 
 #[async_trait]
 impl RecordFetcher for MyTable {
-    async fn fetch(&self, row_ids: RecordBatch) -> Result<RecordBatch> {
-        // row_ids contains __row_id__ column with IDs to fetch
-        // Return complete records for those IDs
+    async fn fetch(&self, index_batch: RecordBatch) -> Result<RecordBatch> {
+        // index_batch contains primary key columns as defined by index_schema()
+        // Return complete records for those primary keys
     }
 }
 ```
@@ -156,50 +159,57 @@ RecordFetchExec
 
 ### AND - Index Intersection
 
-Uses Hash or SortMerge joins to intersect row IDs:
+Uses Hash or SortMerge joins to intersect primary key values:
 
 ```
 RecordFetchExec
-└── HashJoin(on: __row_id__)
-    ├── IndexScanExec(age_index, [age > 25])
-    └── IndexScanExec(dept_index, [department = 'Engineering'])
+└── Projection(PK columns)
+    └── HashJoin(on: PK columns)
+        ├── IndexScanExec(age_index, [age > 25])
+        └── IndexScanExec(dept_index, [department = 'Engineering'])
 ```
 
 **Join Selection**:
-- **SortMergeJoin**: When both indexes return ordered row IDs (`Index::is_ordered() == true`)
+- **SortMergeJoin**: When both indexes return ordered primary keys (`Index::is_ordered()`)
 - **HashJoin**: When inputs are unordered (builds hash table from left side)
 
 ### OR - Union with Deduplication
 
-Uses UnionExec + AggregateExec to deduplicate overlapping row IDs:
+Uses UnionExec + AggregateExec to deduplicate overlapping primary key values:
 
 ```
 RecordFetchExec
-└── AggregateExec(GROUP BY __row_id__)
+└── AggregateExec(GROUP BY PK columns)
     └── UnionExec
         ├── IndexScanExec(age_index, [age < 25])
         └── IndexScanExec(dept_index, [department = 'Sales'])
 ```
 
-This prevents duplicate record fetches when row IDs appear in multiple index results.
+This prevents duplicate record fetches when primary key values appear in multiple index results.
 
 ## Reference Implementation
 
 See [`tests/common/`](tests/common/) for complete working examples:
 
+**Single-column primary key:**
 - [`age_index.rs`](tests/common/age_index.rs): BTreeMap-based index supporting range queries (Eq, Lt, Gt, LtEq, GtEq)
 - [`department_index.rs`](tests/common/department_index.rs): HashMap-based index for equality queries
 - [`employee_provider.rs`](tests/common/employee_provider.rs): Complete TableProvider with IndexedTableProvider integration
 - [`record_fetcher.rs`](tests/common/record_fetcher.rs): RecordFetcher implementation using in-memory data
 
-Integration tests in [`tests/integration_tests.rs`](tests/integration_tests.rs) demonstrate complex query scenarios including deeply nested AND/OR combinations.
+**Composite primary key:**
+- [`composite_pk_age_index.rs`](tests/common/composite_pk_age_index.rs): Index with composite PK (tenant_id, employee_id)
+- [`composite_pk_department_index.rs`](tests/common/composite_pk_department_index.rs): Department index with composite PK
+- [`composite_pk_provider.rs`](tests/common/composite_pk_provider.rs): Multi-tenant TableProvider with composite PK
+- [`composite_pk_fetcher.rs`](tests/common/composite_pk_fetcher.rs): RecordFetcher for composite PK tables
+
+Integration tests in [`tests/integration_tests.rs`](tests/integration_tests.rs) and [`tests/composite_pk_tests.rs`](tests/composite_pk_tests.rs) demonstrate query scenarios including deeply nested AND/OR combinations with both single and composite primary keys.
 
 ## Limitations
 
 1. **Projection pushdown**: Not currently supported for indexed scans (fetches all columns)
 2. **Remaining filters**: Non-indexed filters applied after record fetch, not during index scan
 3. **Partitioning**: Index scans produce single partition output
-4. **Schema compatibility**: Index schema must contain `__row_id__` column (enforced at runtime)
 
 ## Testing
 
@@ -217,8 +227,8 @@ cargo test --test integration_tests
 ```
 
 The test suite includes:
-- 22 unit tests covering execution plan generation and streaming
-- 24 integration tests covering query scenarios from simple to deeply nested
+- 27 unit tests covering execution plan generation and streaming
+- 36 integration tests covering query scenarios from simple to deeply nested, with both single and composite primary keys
 
 ## Compatibility
 

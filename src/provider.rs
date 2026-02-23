@@ -198,7 +198,6 @@ pub trait IndexedTableProvider: TableProvider + Sync + Send {
 mod tests {
     use super::*;
     use crate::physical_plan::Index;
-    use crate::physical_plan::ROW_ID_COLUMN_NAME;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::Session;
     use datafusion::common::Statistics;
@@ -225,11 +224,7 @@ mod tests {
         }
 
         fn index_schema(&self) -> SchemaRef {
-            Arc::new(Schema::new(vec![Field::new(
-                ROW_ID_COLUMN_NAME,
-                DataType::UInt32,
-                false,
-            )]))
+            Arc::new(Schema::new(vec![Field::new("id", DataType::UInt32, false)]))
         }
 
         fn table_name(&self) -> &str {

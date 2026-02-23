@@ -1,11 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, Int32Array, RecordBatch, StringArray, UInt64Array,
-};
-use datafusion::arrow::datatypes::DataType;
-use datafusion::arrow::datatypes::Field;
+use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, Operator};
@@ -13,23 +9,30 @@ use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::Statistics;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_index_provider::physical_plan::create_index_schema;
 use datafusion_index_provider::physical_plan::Index;
 
+use super::composite_pk_provider::composite_pk_schema;
+
 #[derive(Debug)]
-pub struct DepartmentIndex {
-    index: BTreeMap<String, Vec<i32>>,
+pub struct CompositePkDeptIndex {
+    // department -> Vec<(tenant_id, employee_id)>
+    index: BTreeMap<String, Vec<(String, u64)>>,
 }
 
-impl DepartmentIndex {
-    pub fn new(departments: &StringArray, ids: &Int32Array) -> Self {
-        let mut index: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+impl CompositePkDeptIndex {
+    pub fn new(
+        departments: &StringArray,
+        tenant_ids: &StringArray,
+        employee_ids: &UInt64Array,
+    ) -> Self {
+        let mut index: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
         for i in 0..departments.len() {
-            let department = departments.value(i).to_string();
-            let row_id = ids.value(i);
-            index.entry(department).or_default().push(row_id);
+            let dept = departments.value(i).to_string();
+            let tenant = tenant_ids.value(i).to_string();
+            let eid = employee_ids.value(i);
+            index.entry(dept).or_default().push((tenant, eid));
         }
-        DepartmentIndex { index }
+        Self { index }
     }
 
     pub fn create_data_from_filters(
@@ -37,7 +40,7 @@ impl DepartmentIndex {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Vec<RecordBatch> {
-        let mut row_ids = BTreeSet::new();
+        let mut keys = BTreeSet::new();
 
         for filter in filters {
             if let Expr::BinaryExpr(be) = filter {
@@ -47,7 +50,7 @@ impl DepartmentIndex {
                             if be.op == Operator::Eq {
                                 if let Some(ids) = self.index.get(v) {
                                     for id in ids {
-                                        row_ids.insert(*id);
+                                        keys.insert(id.clone());
                                     }
                                 }
                             }
@@ -57,39 +60,46 @@ impl DepartmentIndex {
             }
         }
 
-        let mut final_row_ids: Vec<u64> = row_ids.into_iter().map(|id| id as u64).collect();
-
+        let mut key_vec: Vec<(String, u64)> = keys.into_iter().collect();
         if let Some(l) = limit {
-            final_row_ids.truncate(l);
+            key_vec.truncate(l);
         }
 
-        if final_row_ids.is_empty() {
+        if key_vec.is_empty() {
             return vec![];
         }
 
-        let schema = self.index_schema();
-        let column = Arc::new(UInt64Array::from(final_row_ids)) as ArrayRef;
-        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        let tenants: Vec<&str> = key_vec.iter().map(|(t, _)| t.as_str()).collect();
+        let eids: Vec<u64> = key_vec.iter().map(|(_, e)| *e).collect();
+
+        let batch = RecordBatch::try_new(
+            composite_pk_schema(),
+            vec![
+                Arc::new(StringArray::from(tenants)) as ArrayRef,
+                Arc::new(UInt64Array::from(eids)) as ArrayRef,
+            ],
+        )
+        .unwrap();
 
         vec![batch]
     }
 }
 
-impl Index for DepartmentIndex {
+impl Index for CompositePkDeptIndex {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn name(&self) -> &str {
-        "department_index"
+        "composite_dept_index"
     }
 
     fn index_schema(&self) -> SchemaRef {
-        create_index_schema([Field::new("id", DataType::UInt64, false)])
+        composite_pk_schema()
     }
 
     fn table_name(&self) -> &str {
-        "employees"
+        "multi_tenant_employees"
     }
 
     fn column_name(&self) -> &str {
@@ -102,7 +112,6 @@ impl Index for DepartmentIndex {
         limit: Option<usize>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
         let data = self.create_data_from_filters(filters, limit);
-        log::debug!("Department index data: {data:?}");
         Ok(Box::pin(MemoryStream::try_new(
             data,
             self.index_schema(),

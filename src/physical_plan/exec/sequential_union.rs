@@ -18,7 +18,7 @@
 //! Sequential union execution plan that processes inputs without spawning tasks.
 //!
 //! This module provides [`SequentialUnionExec`], an alternative to DataFusion's
-//! [`UnionExec`] that reports a single partition and processes all input partitions
+//! [`UnionExec`](datafusion::physical_plan::union::UnionExec) that reports a single partition and processes all input partitions
 //! sequentially. This avoids the task spawning that occurs when `CoalescePartitionsExec`
 //! is inserted for multi-partition plans.
 
@@ -42,7 +42,7 @@ use futures::Stream;
 
 /// A union execution plan that processes all inputs sequentially in a single partition.
 ///
-/// Unlike DataFusion's [`UnionExec`] which reports N partitions for N inputs (causing
+/// Unlike DataFusion's [`UnionExec`](datafusion::physical_plan::union::UnionExec) which reports N partitions for N inputs (causing
 /// `CoalescePartitionsExec` to be inserted and spawn Tokio tasks), this operator
 /// always reports exactly 1 partition and chains all input partition streams sequentially.
 ///

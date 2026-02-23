@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
-use datafusion::arrow::datatypes::DataType;
-use datafusion::arrow::datatypes::Field;
+use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, Operator};
@@ -11,23 +9,30 @@ use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::Statistics;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_index_provider::physical_plan::create_index_schema;
 use datafusion_index_provider::physical_plan::Index;
 
+use super::composite_pk_provider::composite_pk_schema;
+
 #[derive(Debug)]
-pub struct AgeIndex {
-    index: BTreeMap<i32, Vec<i32>>,
+pub struct CompositePkAgeIndex {
+    // age -> Vec<(tenant_id, employee_id)>
+    index: BTreeMap<i32, Vec<(String, u64)>>,
 }
 
-impl AgeIndex {
-    pub fn new(ages: &Int32Array, ids: &Int32Array) -> Self {
-        let mut index: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+impl CompositePkAgeIndex {
+    pub fn new(
+        ages: &datafusion::arrow::array::Int32Array,
+        tenant_ids: &StringArray,
+        employee_ids: &UInt64Array,
+    ) -> Self {
+        let mut index: BTreeMap<i32, Vec<(String, u64)>> = BTreeMap::new();
         for i in 0..ages.len() {
             let age = ages.value(i);
-            let row_id = ids.value(i);
-            index.entry(age).or_default().push(row_id);
+            let tenant = tenant_ids.value(i).to_string();
+            let eid = employee_ids.value(i);
+            index.entry(age).or_default().push((tenant, eid));
         }
-        AgeIndex { index }
+        Self { index }
     }
 
     pub fn create_data_from_filters(
@@ -35,7 +40,7 @@ impl AgeIndex {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Vec<RecordBatch> {
-        let mut row_ids = BTreeSet::new();
+        let mut keys = BTreeSet::new();
 
         for filter in filters {
             if let Expr::BinaryExpr(be) = filter {
@@ -46,35 +51,21 @@ impl AgeIndex {
                                 Operator::Eq => {
                                     if let Some(ids) = self.index.get(v) {
                                         for id in ids {
-                                            row_ids.insert(*id);
+                                            keys.insert(id.clone());
                                         }
                                     }
                                 }
                                 Operator::Gt => {
                                     for (_, ids) in self.index.range((v + 1)..) {
                                         for id in ids {
-                                            row_ids.insert(*id);
-                                        }
-                                    }
-                                }
-                                Operator::GtEq => {
-                                    for (_, ids) in self.index.range(v..) {
-                                        for id in ids {
-                                            row_ids.insert(*id);
-                                        }
-                                    }
-                                }
-                                Operator::Lt => {
-                                    for (_, ids) in self.index.range(..v) {
-                                        for id in ids {
-                                            row_ids.insert(*id);
+                                            keys.insert(id.clone());
                                         }
                                     }
                                 }
                                 Operator::LtEq => {
                                     for (_, ids) in self.index.range(..=v) {
                                         for id in ids {
-                                            row_ids.insert(*id);
+                                            keys.insert(id.clone());
                                         }
                                     }
                                 }
@@ -86,39 +77,46 @@ impl AgeIndex {
             }
         }
 
-        let mut final_row_ids: Vec<u64> = row_ids.into_iter().map(|id| id as u64).collect();
-
+        let mut key_vec: Vec<(String, u64)> = keys.into_iter().collect();
         if let Some(l) = limit {
-            final_row_ids.truncate(l);
+            key_vec.truncate(l);
         }
 
-        if final_row_ids.is_empty() {
+        if key_vec.is_empty() {
             return vec![];
         }
 
-        let schema = self.index_schema();
-        let column = Arc::new(UInt64Array::from(final_row_ids)) as ArrayRef;
-        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        let tenants: Vec<&str> = key_vec.iter().map(|(t, _)| t.as_str()).collect();
+        let eids: Vec<u64> = key_vec.iter().map(|(_, e)| *e).collect();
+
+        let batch = RecordBatch::try_new(
+            composite_pk_schema(),
+            vec![
+                Arc::new(StringArray::from(tenants)) as ArrayRef,
+                Arc::new(UInt64Array::from(eids)) as ArrayRef,
+            ],
+        )
+        .unwrap();
 
         vec![batch]
     }
 }
 
-impl Index for AgeIndex {
+impl Index for CompositePkAgeIndex {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn name(&self) -> &str {
-        "age_index"
+        "composite_age_index"
     }
 
     fn index_schema(&self) -> SchemaRef {
-        create_index_schema([Field::new("id", DataType::UInt64, false)])
+        composite_pk_schema()
     }
 
     fn table_name(&self) -> &str {
-        "employee" // Matches EmployeeTableProvider table name
+        "multi_tenant_employees"
     }
 
     fn column_name(&self) -> &str {
@@ -131,8 +129,6 @@ impl Index for AgeIndex {
         limit: Option<usize>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
         let data = self.create_data_from_filters(filters, limit);
-        log::debug!("Age index data: {data:?}");
-
         Ok(Box::pin(MemoryStream::try_new(
             data,
             self.index_schema(),

@@ -26,16 +26,18 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
 
-/// A trait for fetching complete data records based on row IDs produced by index scans.
+/// A trait for fetching complete data records based on primary key values produced by index scans.
 ///
 /// This trait abstracts the process of retrieving actual data records from the underlying
-/// storage system using row identifiers. It serves as the bridge between the index phase
-/// (which produces row IDs) and the final query results (which contain complete records).
+/// storage system using primary key identifiers. It serves as the bridge between the index phase
+/// (which produces primary key values) and the final query results (which contain complete records).
 ///
 /// ## Implementation Requirements
 ///
 /// Implementations must handle:
-/// - **Row ID extraction**: Parse the `__row_id__` column from the input batch
+/// - **Primary key extraction**: Parse the primary key columns from the input batch.
+///   The batch schema matches `Index::index_schema()` and may contain one or more columns
+///   forming a composite primary key.
 /// - **Efficient lookup**: Retrieve records using the most efficient access pattern for your storage
 /// - **Schema consistency**: Return records matching the schema from `schema()`
 /// - **Error handling**: Properly propagate storage errors and handle missing records
@@ -44,8 +46,8 @@ use datafusion::common::Result;
 /// ## Performance Considerations
 ///
 /// The performance of your `RecordFetcher` implementation directly impacts query performance:
-/// - **Batch processing**: Process multiple row IDs together to amortize lookup costs
-/// - **Storage locality**: Consider sorting row IDs to improve storage access patterns  
+/// - **Batch processing**: Process multiple primary keys together to amortize lookup costs
+/// - **Storage locality**: Consider sorting primary keys to improve storage access patterns
 /// - **Caching**: Implement appropriate caching strategies for frequently accessed data
 /// - **Resource management**: Manage memory and connection pooling efficiently
 #[async_trait]
@@ -57,19 +59,20 @@ pub trait RecordFetcher: Send + Sync + std::fmt::Debug {
     /// from your table, not just the row ID column.
     fn schema(&self) -> SchemaRef;
 
-    /// Fetches complete data records corresponding to the row IDs in the input batch.
+    /// Fetches complete data records corresponding to the primary key values in the input batch.
     ///
-    /// This method receives a batch containing row IDs (in the `__row_id__` column)
-    /// and must return the complete records for those IDs. The order of output records
-    /// should correspond to the order of input row IDs.
+    /// This method receives a batch containing primary key columns as defined by
+    /// `Index::index_schema()` and must return the complete records for those keys.
+    /// The order of output records should correspond to the order of input primary keys.
     ///
     /// # Arguments
-    /// * `index_batch` - A `RecordBatch` containing row IDs to fetch. This batch has
-    ///   a single column named `__row_id__` containing the identifiers.
+    /// * `index_batch` - A `RecordBatch` containing primary key values to fetch. The batch
+    ///   schema matches `Index::index_schema()` and may contain one or more columns
+    ///   forming a composite primary key.
     ///
     /// # Returns
     /// A `RecordBatch` containing the complete records with schema matching `schema()`.
-    /// The number of output rows should equal the number of input row IDs unless some
+    /// The number of output rows should equal the number of input primary keys unless some
     /// records are missing (which may indicate data consistency issues).
     ///
     /// # Error Handling

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::physical_plan::{Index, ROW_ID_COLUMN_NAME};
+use crate::physical_plan::Index;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
@@ -138,7 +138,7 @@ impl IndexScanExec {
     /// * `index` - The index to scan for row IDs
     /// * `filters` - Filter expressions to apply during the scan
     /// * `limit` - Optional limit on number of row IDs to return
-    /// * `schema` - Schema of the index output (must contain `__row_id__` column)
+    /// * `schema` - Schema of the index output. All columns form the composite primary key.
     ///
     /// # Returns
     /// A configured `IndexScanExec` that will scan the index with the specified parameters.
@@ -151,10 +151,15 @@ impl IndexScanExec {
         schema: SchemaRef,
     ) -> Result<Self, DataFusionError> {
         let ordering = if index.is_ordered() {
-            vec![PhysicalSortExpr {
-                expr: Arc::new(Column::new_with_schema(ROW_ID_COLUMN_NAME, &schema)?),
-                options: Default::default(),
-            }]
+            schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, field)| PhysicalSortExpr {
+                    expr: Arc::new(Column::new(field.name(), i)),
+                    options: Default::default(),
+                })
+                .collect()
         } else {
             vec![]
         };
@@ -179,7 +184,6 @@ impl IndexScanExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physical_plan::ROW_ID_COLUMN_NAME;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::Statistics;
@@ -196,11 +200,7 @@ mod tests {
     impl MockIndex {
         fn new() -> Self {
             Self {
-                schema: Arc::new(Schema::new(vec![Field::new(
-                    ROW_ID_COLUMN_NAME,
-                    DataType::UInt64,
-                    false,
-                )])),
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
                 scan_called: Mutex::new(false),
             }
         }

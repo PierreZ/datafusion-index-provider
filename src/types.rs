@@ -62,8 +62,8 @@ pub enum IndexFilter {
     /// A disjunction (OR) of multiple filter conditions across different indexes.
     ///
     /// This represents scenarios where any of several conditions can be satisfied.
-    /// The execution strategy unions results from all indexes and deduplicates to
-    /// ensure each row appears only once in the final result.
+    /// The execution strategy unions results from all indexes and deduplicates on
+    /// all primary key columns to ensure each row appears only once in the final result.
     Or(Vec<IndexFilter>),
 }
 
